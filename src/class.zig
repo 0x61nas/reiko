@@ -642,7 +642,7 @@ pub const AttributeInfo = struct {
         line_number: u16,
     };
 
-    pub const LocalVariableEntry = packed struct {
+    pub const LocalVariableEntry = struct {
         start_pc: u16,
         length: u16,
         name_index: u16,
@@ -799,19 +799,25 @@ pub const AttributeInfo = struct {
             attribute = .{ .LineNumberTable = .{
                 .line_number_table = std.ArrayList(LineNumberEntry).fromOwnedSlice(allocator, table),
             } };
-            // } else if (mem.eql(u8, name, "LocalVariableTable")) {
-            //     const tlen: u16 = try reader.readInt(u16, .big);
-            //     std.log.debug("length: {d}", .{length});
-            //     std.log.debug("tlen: {d}", .{tlen});
-            //     std.debug.assert(tlen * @sizeOf(LocalVariableEntry) == (length - 2));
-            //     var table = try allocator.alloc(LocalVariableEntry, tlen);
-            //     errdefer allocator.free(table);
-            //     for (0..tlen) |i| {
-            //         table[i] = try reader.readStructEndian(LocalVariableEntry, .big);
-            //     }
-            //     attribute = .{ .LocalVariableTable = .{
-            //         .local_variable_table = std.ArrayList(LocalVariableEntry).fromOwnedSlice(allocator, table),
-            //     } };
+        } else if (mem.eql(u8, name, "LocalVariableTable")) {
+            const tlen: u16 = try reader.readInt(u16, .big);
+            std.log.debug("length: {d}", .{length});
+            std.log.debug("tlen: {d}", .{tlen});
+            std.debug.assert(tlen * @sizeOf(LocalVariableEntry) == (length - 2));
+            var table = try allocator.alloc(LocalVariableEntry, tlen);
+            errdefer allocator.free(table);
+            for (0..tlen) |i| {
+                table[i] = .{
+                    .start_pc = try reader.readInt(u16, .big),
+                    .length = try reader.readInt(u16, .big),
+                    .name_index = try reader.readInt(u16, .big),
+                    .descriptor_index = try reader.readInt(u16, .big),
+                    .index = try reader.readInt(u16, .big),
+                };
+            }
+            attribute = .{ .LocalVariableTable = .{
+                .local_variable_table = std.ArrayList(LocalVariableEntry).fromOwnedSlice(allocator, table),
+            } };
         } else {
             std.log.warn("Unkown attribute: {s}", .{name});
             // IMPORTANT(anas): do not forget to free this!
