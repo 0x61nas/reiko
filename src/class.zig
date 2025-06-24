@@ -62,34 +62,59 @@ pub fn read(reader: anytype, allocator: std.mem.Allocator) !Me {
 
     const constant_pool_count: u16 = try reader.readInt(u16, .big);
     var constant_pool = try ConstantPool.initCapacity(allocator, constant_pool_count);
-    for (0..constant_pool_count - 1) |_| {
-        constant_pool.appendAssumeCapacity(try ConstantInfo.read(reader, allocator));
+    errdefer constant_pool.deinit();
+    {
+        var i: usize = 0;
+        while (i < constant_pool_count - 1) {
+            const c = try ConstantInfo.read(reader, allocator);
+            // NOTE(anas): apparently the `constant_pool_count` counts the 8-bytes values as a two separate items.
+            // This done to keep the size of our `ConstantInfo` union 32bit
+            if (c == .long or c == .double) {
+                constant_pool.appendAssumeCapacity(c);
+                // read the second half of the big number
+                const low_bytes: u32 = try reader.readInt(u32, .big);
+                if (c == .long) {
+                    constant_pool.appendAssumeCapacity(.{ .long = .{ .low_bytes = low_bytes } });
+                } else {
+                    constant_pool.appendAssumeCapacity(.{ .double = .{ .low_bytes = low_bytes } });
+                }
+                i += 2;
+                continue;
+            }
+            constant_pool.appendAssumeCapacity(c);
+            i += 1;
+        }
     }
 
     const access_flags: ClassAccessFlags = @bitCast(try reader.readInt(u16, .big));
     const this_class = try reader.readInt(u16, .big);
     const super_class = try reader.readInt(u16, .big);
+    std.log.debug("this_class {d}", .{this_class});
 
     const interfaces_count: u16 = try reader.readInt(u16, .big);
     var interfaces = try Interfaces.initCapacity(allocator, interfaces_count);
+    errdefer interfaces.deinit();
     for (0..interfaces_count) |_| {
         interfaces.appendAssumeCapacity(try reader.readInt(u16, .big));
     }
 
     const fields_count: u16 = try reader.readInt(u16, .big);
     var fields = try Fields.initCapacity(allocator, fields_count);
+    errdefer fields.deinit();
     for (0..fields_count) |_| {
         fields.appendAssumeCapacity(try FieldInfo.read(reader, allocator, &constant_pool));
     }
 
     const methods_count: u16 = try reader.readInt(u16, .big);
     var methods = try Methods.initCapacity(allocator, methods_count);
+    errdefer methods.deinit();
     for (0..methods_count) |_| {
         methods.appendAssumeCapacity(try MethodInfo.read(reader, allocator, &constant_pool));
     }
 
     const attributes_count = try reader.readInt(u16, .big);
     var attributes = try Attributes.initCapacity(allocator, attributes_count);
+    errdefer attributes.deinit();
     for (0..attributes_count) |_| {
         attributes.appendAssumeCapacity(try AttributeInfo.read(reader, allocator, &constant_pool));
     }
@@ -106,6 +131,11 @@ pub fn read(reader: anytype, allocator: std.mem.Allocator) !Me {
         .methods = methods,
         .attributes = attributes,
     };
+}
+
+pub fn deinit(me: Me) void {
+    _ = me;
+    // TODO(anas): de-allocate all stuff
 }
 
 // https://docs.oracle.com/javase/specs/jvms/se22/html/jvms-4.html#jvms-4.1-200-E.1
@@ -164,6 +194,10 @@ pub const ConstantPool = struct {
     pub inline fn at_checked(me: *const ConstantPool, idx: u16) !ConstantInfo {
         if (idx == 0 or idx - 1 > me.pool.items.len) return error.ConstantIndexOutsideRange;
         return me.pool.items[idx - 1];
+    }
+
+    pub inline fn deinit(me: @This()) void {
+        me.pool.deinit();
     }
 };
 
@@ -289,47 +323,9 @@ pub const ConstantInfo = union(ConstantInfo.Tag) {
         bytes: u32,
     };
 
-    pub const Number8Bytes = struct {
+    pub const Number8Bytes = union {
         high_bytes: u32,
         low_bytes: u32,
-
-        pub fn as_long(me: Number8Bytes) u64 {
-            return (@as(u64, me.high_bytes) << 32) | me.low_bytes;
-        }
-
-        pub fn as_double(me: Number8Bytes) f64 {
-            // Combine the high and low bytes into a single u64
-            const bits: u64 = (@as(u64, me.high_bytes) << 32) | me.low_bytes;
-
-            // Extract sign bit
-            const s: i32 = if ((bits >> 63) == 0) 1 else -1;
-
-            // Extract exponent
-            const e: i32 = @intCast((bits >> 52) & 0x7FF);
-
-            // Extract mantissa
-            const m: u64 = if (e == 0)
-                (bits & 0xFFFFFFFFFFFFF) << 1
-            else
-                (bits & 0xFFFFFFFFFFFFF) | 0x10000000000000;
-
-            // Handle special cases
-            if (e == 0x7FF) {
-                // Infinity or NaN
-                if (m == 0) {
-                    return if (s == 1) std.math.inf(f64) else -std.math.inf(f64);
-                } else {
-                    return std.math.nan(f64);
-                }
-            }
-
-            // Calculate the value
-            const exponent = e - 1023;
-            const mantissa_value = @as(f64, @floatFromInt(m)) / @as(f64, @floatFromInt(0x10000000000000));
-            const result = @as(f64, @floatFromInt(s)) * mantissa_value * std.math.pow(f64, 2.0, @floatFromInt(exponent));
-
-            return result;
-        }
     };
 
     pub const DynamicInfoConst = struct {
@@ -357,19 +353,19 @@ pub const ConstantInfo = union(ConstantInfo.Tag) {
                 .string_index = try reader.readInt(u16, .big),
             } },
             .integer => .{ .integer = .{
-                .bytes = try reader.readInt(u16, .big),
+                .bytes = try reader.readInt(u32, .big),
             } },
             .float => .{ .float = .{
-                .bytes = try reader.readInt(u16, .big),
+                .bytes = try reader.readInt(u32, .big),
             } },
             .long => .{ .long = .{
                 .high_bytes = try reader.readInt(u32, .big),
-                .low_bytes = try reader.readInt(u32, .big),
             } },
-            .double => .{ .double = .{
-                .high_bytes = try reader.readInt(u32, .big),
-                .low_bytes = try reader.readInt(u32, .big),
-            } },
+            .double => .{
+                .double = .{
+                    .high_bytes = try reader.readInt(u32, .big),
+                },
+            },
             .name_and_type => .{ .name_and_type = .{
                 .name_index = try reader.readInt(u16, .big),
                 .descriptor_index = try reader.readInt(u16, .big),
@@ -377,8 +373,10 @@ pub const ConstantInfo = union(ConstantInfo.Tag) {
             .utf8 => blk: {
                 const length = try reader.readInt(u16, .big);
                 const bytes = try allocator.alloc(u8, length);
+                errdefer allocator.free(bytes);
                 // TEST(anas): make sure that this function returns an error when there is no enough bytes
-                _ = try reader.readAtLeast(bytes, length);
+                const readen = try reader.readAtLeast(bytes, length);
+                std.debug.assert(readen == length);
                 break :blk .{ .utf8 = .{
                     .bytes = bytes,
                 } };
@@ -422,6 +420,7 @@ pub const FieldInfo = struct {
 
         const attributes_count: u16 = try reader.readInt(u16, .big);
         var attributes = try Attributes.initCapacity(allocator, attributes_count);
+        errdefer attributes.deinit();
         for (0..attributes_count) |_| {
             attributes.appendAssumeCapacity(try AttributeInfo.read(reader, allocator, constant_pool));
         }
@@ -478,6 +477,7 @@ pub const MethodInfo = struct {
 
         const attributes_count: u16 = try reader.readInt(u16, .big);
         var attributes = try Attributes.initCapacity(allocator, attributes_count);
+        errdefer attributes.deinit();
         for (0..attributes_count) |_| {
             attributes.appendAssumeCapacity(try AttributeInfo.read(reader, allocator, constant_pool));
         }
@@ -523,9 +523,12 @@ pub const AttributeInfo = struct {
     info: Attribute,
 
     pub const Attribute = union(enum) {
+        // NOTE(anas): The value of the attribute_length item must be two.
         ConstantValue: struct {
+            /// The value of the constantvalue_index item must be a valid index into the constant_pool table. The constant_pool entry at that index gives the value represented by this attribute.
             constantvalue_index: u16,
         },
+        // IMPORTANT(anas):  If the method is either native or abstract, and is not a class or interface initialization method, then its method_info structure must not have a Code attribute in its attributes table. Otherwise, its method_info structure must have exactly one Code attribute in its attributes table.
         Code: *CodeAttribute,
         StackMapTable: struct {
             // number_of_entries: u16,
@@ -537,12 +540,7 @@ pub const AttributeInfo = struct {
         },
         InnerClasses: struct {
             // number_of_classes: u16,
-            classes: std.ArrayList(struct {
-                inner_class_info_index: u16,
-                outer_class_info_index: u16,
-                inner_name_index: u16,
-                inner_class_access_flags: u16,
-            }),
+            classes: std.ArrayList(InnerClass),
         },
         EnclosingMethod: struct {
             class_index: u16,
@@ -561,22 +559,15 @@ pub const AttributeInfo = struct {
         },
         LineNumberTable: struct {
             // u2 line_number_table_length;
-            line_number_table: std.ArrayList(struct {
-                start_pc: u16,
-                line_number: u16,
-            }),
+            line_number_table: std.ArrayList(LineNumberEntry),
         },
         // 4.7.13
         LocalVariableTable: struct {
             // u2 local_variable_table_length;
-            local_variable_table: std.ArrayList(struct {
-                start_pc: u16,
-                length: u16,
-                name_index: u16,
-                descriptor_index: u16,
-                index: u16,
-            }),
+            local_variable_table: std.ArrayList(LocalVariableEntry),
         },
+        // TODO(anas): add the rest
+
         // NOTE(anas): Compilers are permitted to define and emit class files containing new attributes in the attributes tables of class file structures, field_info structures, method_info structures, and Code attributes (§4.7.3).
         // Java Virtual Machine implementations are permitted to recognize and use new attributes found in these attributes tables. However, any attribute not defined as part of this specification must not affect the semantics of the class file. Java Virtual Machine implementations are required to silently ignore attributes they do not recognize.
         Unkown: std.ArrayList(u8),
@@ -620,14 +611,14 @@ pub const AttributeInfo = struct {
             offset_delta: u16,
         },
         same_frame_extended: struct {
-            frame_type: u8, // SAME_FRAME_EXTENDED; /* 251 */
+            // frame_type: u8, // SAME_FRAME_EXTENDED; /* 251 */
             offset_delta: u16,
         },
         append_frame: struct {
             frame_type: u8, // APPEND; /* 252-254 */
             offset_delta: u16,
             // verification_type_info locals[frame_type - 251];
-            locals: std.ArrayList(VerificationTypeInfo),
+            locals: []VerificationTypeInfo,
         },
         full_frame: struct {
             // frame_type: u8, // FULL_FRAME; /* 255 */
@@ -639,6 +630,26 @@ pub const AttributeInfo = struct {
         },
     };
 
+    pub const InnerClass = packed struct {
+        inner_class_info_index: u16,
+        outer_class_info_index: u16,
+        inner_name_index: u16,
+        inner_class_access_flags: u16,
+    };
+
+    pub const LineNumberEntry = packed struct {
+        start_pc: u16,
+        line_number: u16,
+    };
+
+    pub const LocalVariableEntry = packed struct {
+        start_pc: u16,
+        length: u16,
+        name_index: u16,
+        descriptor_index: u16,
+        index: u16,
+    };
+
     pub fn read(reader: anytype, allocator: mem.Allocator, constant_pool: *const ConstantPool) !AttributeInfo {
         const name_index: u16 = try reader.readInt(u16, .big);
         const length = try reader.readInt(u32, .big);
@@ -647,6 +658,7 @@ pub const AttributeInfo = struct {
 
         var attribute: Attribute = undefined;
         const name = attr_name.utf8.bytes;
+        std.log.debug("AttributeInfo: name = {s}", .{name});
         if (mem.eql(u8, name, "ConstantValue")) {
             attribute = .{ .ConstantValue = .{
                 .constantvalue_index = try reader.readInt(u16, .big),
@@ -654,34 +666,159 @@ pub const AttributeInfo = struct {
         } else if (mem.eql(u8, name, "Code")) {
             // IMPORTANT(anas): do not forget to free this!
             var code = try allocator.create(CodeAttribute);
+            errdefer allocator.destroy(&code);
             code.max_stack = try reader.readInt(u16, .big);
             code.max_locals = try reader.readInt(u16, .big);
 
             const code_length: u32 = try reader.readInt(u32, .big);
             const code_bytes = try allocator.alloc(u8, code_length);
-            _ = try reader.readAtLeast(code_bytes, code_length);
+            errdefer allocator.free(code_bytes);
+            const readen = try reader.readAtLeast(code_bytes, code_length);
+            std.debug.assert(readen == code_length);
             code.code = std.ArrayList(u8).fromOwnedSlice(allocator, code_bytes);
 
             const exception_table_length: u16 = try reader.readInt(u16, .big);
             var exception_table = try std.ArrayList(CodeAttribute.ExceptionTableEntry).initCapacity(allocator, exception_table_length);
+            errdefer exception_table.deinit();
             for (0..exception_table_length) |_| {
+                // TEST(anas): make sure that `readStructEndian` apply the endianss conversation on each field
                 exception_table.appendAssumeCapacity(try reader.readStructEndian(CodeAttribute.ExceptionTableEntry, .big));
             }
             code.exception_table = exception_table;
 
             const attributes_count: u16 = try reader.readInt(u16, .big);
             var attributes = try Attributes.initCapacity(allocator, attributes_count);
+            errdefer attributes.deinit();
             for (0..attributes_count) |_| {
                 attributes.appendAssumeCapacity(try AttributeInfo.read(reader, allocator, constant_pool));
             }
             code.attributes = attributes;
 
             attribute = .{ .Code = code };
+        } else if (mem.eql(u8, name, "StackMapTable")) {
+            const number_of_entries: u16 = try reader.readInt(u16, .big);
+            var entries = try std.ArrayList(StackMapFrame).initCapacity(allocator, number_of_entries);
+            errdefer entries.deinit();
+            for (0..number_of_entries) |_| {
+                const frame_type: u8 = try reader.readByte();
+                switch (frame_type) {
+                    0...63 => entries.appendAssumeCapacity(.{ .same_frame = .{ .frame_type = frame_type } }),
+                    64...127 => entries.appendAssumeCapacity(.{ .same_locals_1_stack_item_frame = .{
+                        .frame_type = frame_type,
+                        .stack = .{try VerificationTypeInfo.read(reader)},
+                    } }),
+                    247 => entries.appendAssumeCapacity(.{ .same_locals_1_stack_item_frame_extended = .{
+                        .offset_delta = try reader.readInt(u16, .big),
+                        .stack = .{try VerificationTypeInfo.read(reader)},
+                    } }),
+                    248...250 => entries.appendAssumeCapacity(.{
+                        .chop_frame = .{ .frame_type = frame_type, .offset_delta = try reader.readInt(u16, .big) },
+                    }),
+                    251 => entries.appendAssumeCapacity(.{
+                        .same_frame_extended = .{ .offset_delta = try reader.readInt(u16, .big) },
+                    }),
+                    252...254 => entries.appendAssumeCapacity(.{ .append_frame = .{
+                        .frame_type = frame_type,
+                        .offset_delta = try reader.readInt(u16, .big),
+                        .locals = blk: {
+                            var locals = try allocator.alloc(VerificationTypeInfo, frame_type - 251);
+                            errdefer allocator.free(locals);
+                            for (0..(frame_type - 251)) |i| {
+                                locals[i] = try VerificationTypeInfo.read(reader);
+                            }
+                            break :blk locals;
+                        },
+                    } }),
+                    255 => entries.appendAssumeCapacity(.{ .full_frame = .{ .offset_delta = try reader.readInt(u16, .big), .locals = blk: {
+                        const number_of_locals: u16 = try reader.readInt(u16, .big);
+                        var locals = try std.ArrayList(VerificationTypeInfo).initCapacity(allocator, number_of_locals);
+                        errdefer locals.deinit();
+                        for (0..number_of_locals) |_| {
+                            locals.appendAssumeCapacity(try VerificationTypeInfo.read(reader));
+                        }
+                        break :blk locals;
+                    }, .stack = blk: {
+                        const number_of_stack_items: u16 = try reader.readInt(u16, .big);
+                        var stack = try std.ArrayList(VerificationTypeInfo).initCapacity(allocator, number_of_stack_items);
+                        errdefer stack.deinit();
+                        for (0..number_of_stack_items) |_| {
+                            stack.appendAssumeCapacity(try VerificationTypeInfo.read(reader));
+                        }
+                        break :blk stack;
+                    } } }),
+                    else => {
+                        // TODO(anas): return error?
+                        std.log.err("Unkown stack map frame tag", .{});
+                    },
+                }
+            }
+            attribute = .{ .StackMapTable = .{ .entries = entries } };
+        } else if (mem.eql(u8, name, "Exceptions")) {
+            const number_of_exceptions: u16 = try reader.readInt(u16, .big);
+            // TEST(anas): we are dont sure if this way is more optimal than the pre allocated ArrayList way
+            var entries = try allocator.alloc(u16, number_of_exceptions);
+            errdefer allocator.free(entries);
+            for (0..number_of_exceptions) |i| {
+                entries[i] = try reader.readInt(u16, .big);
+            }
+            attribute = .{ .Exceptions = .{ .exception_index_table = std.ArrayList(u16).fromOwnedSlice(allocator, entries) } };
+        } else if (mem.eql(u8, name, "InnerClasses")) {
+            const number_of_classes: u16 = try reader.readInt(u16, .big);
+            var classes = try allocator.alloc(InnerClass, number_of_classes);
+            errdefer allocator.free(classes);
+            for (0..number_of_classes) |i| {
+                classes[i] = try reader.readStructEndian(InnerClass, .big);
+            }
+            attribute = .{ .InnerClasses = .{ .classes = std.ArrayList(InnerClass).fromOwnedSlice(allocator, classes) } };
+        } else if (mem.eql(u8, name, "EnclosingMethod")) {
+            attribute = .{ .EnclosingMethod = .{
+                .class_index = try reader.readInt(u16, .big),
+                .method_index = try reader.readInt(u16, .big),
+            } };
+        } else if (mem.eql(u8, name, "Synthetic")) {
+            if (length != 0) return error.InvalidAttributeLength;
+            attribute = .{ .Synthetic = {} };
+        } else if (mem.eql(u8, name, "Signature")) {
+            attribute = .{ .Signature = .{ .signature_index = try reader.readInt(u16, .big) } };
+        } else if (mem.eql(u8, name, "SourceFile")) {
+            attribute = .{ .SourceFile = .{ .sourcefile_index = try reader.readInt(u16, .big) } };
+        } else if (mem.eql(u8, name, "SourceDebugExtension")) {
+            const debug_extension = try allocator.alloc(u8, length);
+            errdefer allocator.free(debug_extension);
+            const readen = try reader.readAtLeast(debug_extension, length);
+            std.debug.assert(readen == length);
+            attribute = .{ .SourceDebugExtension = .{ .debug_extension = debug_extension } };
+        } else if (mem.eql(u8, name, "LineNumberTable")) {
+            const tlen: u16 = try reader.readInt(u16, .big);
+            std.debug.assert(tlen * @sizeOf(LineNumberEntry) == (length - 2));
+            var table = try allocator.alloc(LineNumberEntry, tlen);
+            errdefer allocator.free(table);
+            for (0..tlen) |i| {
+                table[i] = try reader.readStructEndian(LineNumberEntry, .big);
+            }
+            attribute = .{ .LineNumberTable = .{
+                .line_number_table = std.ArrayList(LineNumberEntry).fromOwnedSlice(allocator, table),
+            } };
+            // } else if (mem.eql(u8, name, "LocalVariableTable")) {
+            //     const tlen: u16 = try reader.readInt(u16, .big);
+            //     std.log.debug("length: {d}", .{length});
+            //     std.log.debug("tlen: {d}", .{tlen});
+            //     std.debug.assert(tlen * @sizeOf(LocalVariableEntry) == (length - 2));
+            //     var table = try allocator.alloc(LocalVariableEntry, tlen);
+            //     errdefer allocator.free(table);
+            //     for (0..tlen) |i| {
+            //         table[i] = try reader.readStructEndian(LocalVariableEntry, .big);
+            //     }
+            //     attribute = .{ .LocalVariableTable = .{
+            //         .local_variable_table = std.ArrayList(LocalVariableEntry).fromOwnedSlice(allocator, table),
+            //     } };
         } else {
             std.log.warn("Unkown attribute: {s}", .{name});
             // IMPORTANT(anas): do not forget to free this!
             const bytes = try allocator.alloc(u8, length);
-            _ = try reader.readAtLeast(bytes, length);
+            errdefer allocator.free(bytes);
+            const readen = try reader.readAtLeast(bytes, length);
+            std.debug.assert(readen == length);
             attribute = .{ .Unkown = std.ArrayList(u8).fromOwnedSlice(allocator, bytes) };
         }
 
@@ -692,14 +829,56 @@ pub const AttributeInfo = struct {
     }
 };
 
-pub const VerificationTypeInfo = union(enum) {
-    // Top_variable_info;
-    // Integer_variable_info;
-    // Float_variable_info;
-    // Long_variable_info;
-    // Double_variable_info;
-    // Null_variable_info;
-    // UninitializedThis_variable_info;
-    // Object_variable_info;
-    // Uninitialized_variable_info;
+pub const VerificationTypeInfo = union(VerificationTypeInfo.Tag) {
+    Top_variable_info: void,
+    Integer_variable_info: void,
+    Float_variable_info: void,
+    Long_variable_info: void,
+    Double_variable_info: void,
+    Null_variable_info: void,
+    UninitializedThis_variable_info: void,
+    Object_variable_info: struct {
+        cpool_index: u16,
+    },
+    Uninitialized_variable_info: struct {
+        offset: u16,
+    },
+
+    pub const Tag = enum(u8) {
+        Top_variable_info = 0,
+        Integer_variable_info = 1,
+        Float_variable_info = 2,
+        Long_variable_info = 4,
+        Double_variable_info = 3,
+        Null_variable_info = 5,
+        UninitializedThis_variable_info = 6,
+        Object_variable_info = 7,
+        Uninitialized_variable_info = 8,
+
+        pub inline fn from_u8(v: u8) !@This() {
+            if (v < 9) {
+                return @enumFromInt(v);
+            }
+            return error.InvalidVerificationInfoTag;
+        }
+    };
+
+    pub fn read(reader: anytype) !VerificationTypeInfo {
+        const tag = try Tag.from_u8(try reader.readByte());
+        return switch (tag) {
+            .Top_variable_info => .{ .Top_variable_info = {} },
+            .Integer_variable_info => .{ .Integer_variable_info = {} },
+            .Float_variable_info => .{ .Float_variable_info = {} },
+            .Long_variable_info => .{ .Long_variable_info = {} },
+            .Double_variable_info => .{ .Double_variable_info = {} },
+            .Null_variable_info => .{ .Null_variable_info = {} },
+            .UninitializedThis_variable_info => .{ .UninitializedThis_variable_info = {} },
+            .Object_variable_info => .{ .Object_variable_info = .{
+                .cpool_index = try reader.readInt(u16, .big),
+            } },
+            .Uninitialized_variable_info => .{ .Uninitialized_variable_info = .{
+                .offset = try reader.readInt(u16, .big),
+            } },
+        };
+    }
 };
