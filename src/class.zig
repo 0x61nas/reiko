@@ -566,6 +566,14 @@ pub const AttributeInfo = struct {
             // u2 local_variable_table_length;
             local_variable_table: std.ArrayList(LocalVariableEntry),
         },
+        Deprecated: void, // NOTE(anas): the length must be zero.
+        // NOTE(anas): There may be at most one RuntimeVisibleAnnotations attribute in the attributes table of a ClassFile, field_info, method_info, or record_component_info structure.
+        RuntimeVisibleAnnotations: AnnotationsCollction,
+        // The RuntimeInvisibleAnnotations attribute is similar to the RuntimeVisibleAnnotations attribute (§4.7.16), except that the annotations represented by a RuntimeInvisibleAnnotations attribute must not be made available for return by reflective APIs, unless the Java Virtual Machine has been instructed to retain these annotations via some implementation-specific mechanism such as a command line flag. In the absence of such instructions, the Java Virtual Machine ignores this attribute.
+        RuntimeInvisibleAnnotations: AnnotationsCollction,
+        RuntimeVisibleParameterAnnotations: ParameterAnnotations,
+        RuntimeInvisibleParameterAnnotations: ParameterAnnotations,
+        RuntimeVisibleTypeAnnotations: TypeAnnotationsCollction,
         // TODO(anas): add the rest
 
         // NOTE(anas): Compilers are permitted to define and emit class files containing new attributes in the attributes tables of class file structures, field_info structures, method_info structures, and Code attributes (§4.7.3).
@@ -650,6 +658,262 @@ pub const AttributeInfo = struct {
         index: u16,
     };
 
+    // The RuntimeVisibleAnnotations attribute is a variable-length attribute in the attributes table of a ClassFile, field_info, method_info, or record_component_info structure (§4.1, §4.5, §4.6, §4.7.30).
+    // The RuntimeVisibleAnnotations attribute stores run-time visible annotations on the declaration of the corresponding class, field, method, or record component.
+    pub const AnnotationsCollction = struct {
+        // u2         num_annotations;
+        // NOTE(anas): I don't think that the user will play alot with the annotations, so no need to pay the ArrayList cost
+        // we should also reconsider our decision in using ArrayList in other parts, because i don't think we'll modify the Class object directly anyway
+        annotations: []Annotation,
+
+        pub inline fn read(reader: anytype, allocator: mem.Allocator) !AnnotationsCollction {
+            const tlen: u16 = try reader.readInt(u16, .big);
+            // std.debug.assert(tlen * @sizeOf(Annotation) == (length - 2));
+            var table = try allocator.alloc(Annotation, tlen);
+            errdefer allocator.free(table);
+            for (0..tlen) |i| {
+                table[i] = try Annotation.read(reader, allocator);
+            }
+            return .{ .annotations = table };
+        }
+    };
+
+    pub const ParameterAnnotations = struct {
+        // u1 num_parameters;
+        parameter_annotations: []AnnotationsCollction,
+
+        pub inline fn read(reader: anytype, allocator: mem.Allocator) !ParameterAnnotations {
+            const num_parameters: u8 = try reader.readByte();
+            var ptaple = try allocator.alloc(AnnotationsCollction, num_parameters);
+            errdefer allocator.free(ptaple);
+            for (0..num_parameters) |i| {
+                ptaple[i] = try AnnotationsCollction.read(reader, allocator);
+            }
+            return .{ .parameter_annotations = ptaple };
+        }
+    };
+
+    pub const Annotation = struct {
+        // The value of the type_index item must be a valid index into the constant_pool table. The constant_pool entry at that index must be a CONSTANT_Utf8_info structure (§4.4.7) representing a field descriptor (§4.3.2). The field descriptor denotes the type of the annotation represented by this annotation structure.
+        type_index: u16,
+        // num_element_value_pairs: u16,
+        element_value_pairs: []ElementValuePair,
+
+        pub fn read(reader: anytype, allocator: mem.Allocator) anyerror!Annotation {
+            const type_index: u16 = try reader.readInt(u16, .big);
+            const num_element_value_pairs: u16 = try reader.readInt(u16, .big);
+            var element_value_pairs = try allocator.alloc(ElementValuePair, num_element_value_pairs);
+            errdefer allocator.free(element_value_pairs);
+            for (0..num_element_value_pairs) |i| {
+                element_value_pairs[i] = try ElementValuePair.read(reader, allocator);
+            }
+            return .{ .type_index = type_index, .element_value_pairs = element_value_pairs };
+        }
+    };
+
+    pub const TypeAnnotationsCollction = struct {
+        // u2              num_annotations;
+        annotations: []TypeAnnotation,
+
+        pub inline fn read(reader: anytype, allocator: mem.Allocator) !TypeAnnotationsCollction {
+            const tlen: u16 = try reader.readInt(u16, .big);
+            // std.debug.assert(tlen * @sizeOf(Annotation) == (length - 2));
+            var table = try allocator.alloc(TypeAnnotation, tlen);
+            errdefer allocator.free(table);
+            for (0..tlen) |i| {
+                table[i] = try TypeAnnotation.read(reader, allocator);
+            }
+            return .{ .annotations = table };
+        }
+    };
+
+    pub const TypeAnnotation = struct {
+        target_tag: u8,
+        target_info: union {
+            type_parameter_target: struct { type_parameter_index: u8 },
+            supertype_target: struct { supertype_index: u16 },
+            type_parameter_bound_target: struct {
+                type_parameter_index: u8,
+                bound_index: u8,
+            },
+            //  The empty_target item indicates that an annotation appears on either the type in a field declaration, the type in a record component declaration, the return type of a method, the type of a newly constructed object, or the receiver type of a method or constructor.
+            empty_target: void,
+            formal_parameter_target: struct { formal_parameter_index: u8 },
+            throws_target: struct { throws_type_index: u16 },
+            localvar_target: struct {
+                // u2 table_length;
+                table: []LocalVarTableEntry,
+            },
+            catch_target: struct { exception_table_index: u16 },
+            offset_target: struct { offset: u16 },
+            type_argument_target: struct {
+                offset: u16,
+                type_argument_index: u8,
+            },
+        },
+        target_path: TargetPath,
+        type_index: u16,
+        // u2        num_element_value_pairs;
+        element_value_pairs: []ElementValuePair,
+
+        pub const LocalVarTableEntry = packed struct {
+            start_pc: u16,
+            length: u16,
+            // NOTE(anas): The given local variable must be at index in the local variable array of the current frame.
+            // If the local variable at index is of type double or long, it occupies both index and index + 1.
+            index: u16,
+        };
+
+        pub fn read(reader: anytype, allocator: mem.Allocator) !TypeAnnotation {
+            var type_ann: TypeAnnotation = undefined;
+            const target_tag: u8 = try reader.readByte();
+            type_ann.target_tag = target_tag;
+            type_ann.target_info = switch (target_tag) {
+                0x00, 0x01 => .{ .type_parameter_target = .{ .type_parameter_index = try reader.readByte() } },
+                0x10 => .{ .supertype_target = .{ .supertype_index = try reader.readInt(u16, .big) } },
+                0x11, 0x12 => .{ .type_parameter_bound_target = .{
+                    .type_parameter_index = try reader.readByte(),
+                    .bound_index = try reader.readByte(),
+                } },
+                0x13, 0x14, 0x15 => .{ .empty_target = {} },
+                0x16 => .{ .formal_parameter_target = .{ .formal_parameter_index = try reader.readByte() } },
+                0x17 => .{ .throws_target = .{ .throws_type_index = try reader.readInt(u16, .big) } },
+                0x40, 0x41 => .{ .localvar_target = blk: {
+                    const tlen: u16 = try reader.readInt(u16, .big);
+                    var table = try allocator.alloc(LocalVarTableEntry, tlen);
+                    errdefer allocator.free(table);
+                    for (0..tlen) |i| {
+                        table[i] = try reader.readStructEndian(LocalVarTableEntry, .big);
+                    }
+                    break :blk .{ .table = table };
+                } },
+                0x42 => .{ .catch_target = .{ .exception_table_index = try reader.readInt(u16, .big) } },
+                0x43...0x46 => .{ .offset_target = .{ .offset = try reader.readInt(u16, .big) } },
+                0x47...0x4B => .{ .type_argument_target = .{
+                    .offset = try reader.readInt(u16, .big),
+                    .type_argument_index = try reader.readByte(),
+                } },
+                else => return error.InvalidTargetTag,
+            };
+            type_ann.target_path = try TargetPath.read(reader, allocator);
+            type_ann.type_index = try reader.readInt(u16, .big);
+            const num_element_value_pairs: u16 = try reader.readInt(u16, .big);
+            var element_value_pairs = try allocator.alloc(ElementValuePair, num_element_value_pairs);
+            errdefer allocator.free(element_value_pairs);
+            for (0..num_element_value_pairs) |i| {
+                element_value_pairs[i] = try ElementValuePair.read(reader, allocator);
+            }
+            type_ann.element_value_pairs = element_value_pairs;
+            return type_ann;
+        }
+    };
+
+    //  §4.7.20.2.
+    pub const TargetPath = struct {
+        // u1 path_length;
+        path: []PathEntry,
+
+        pub const PathEntry = packed struct {
+            type_path_kind: u8,
+            type_argument_index: u8,
+        };
+
+        pub inline fn read(reader: anytype, allocator: mem.Allocator) !TargetPath {
+            const len: u8 = try reader.readByte();
+            var path = try allocator.alloc(PathEntry, len);
+            errdefer allocator.free(path);
+            for (0..len) |i| {
+                path[i] = .{
+                    .type_path_kind = try reader.readByte(),
+                    .type_argument_index = try reader.readByte(),
+                };
+            }
+            return .{ .path = path };
+        }
+    };
+
+    pub const ElementValuePair = struct {
+        element_name_index: u16,
+        value: ElementValue,
+
+        pub const ElementValue = struct {
+            tag: Tag,
+            value: Value,
+
+            pub const Tag = enum(u8) {
+                Byte = 'B',
+                Char = 'C',
+                Double = 'D',
+                Float = 'F',
+                Int = 'I',
+                Long = 'J',
+                Short = 'S',
+                Boolean = 'Z',
+                String = 's',
+                Enum = 'e',
+                Class = 'c',
+                Annotation = '@',
+                Array = '[',
+
+                fn from_u8(v: u8) !Tag {
+                    inline for (@typeInfo(@This()).@"enum".fields) |f| {
+                        if (f.value == v) return @field(@This(), f.name);
+                    }
+                    return error.InvalidElementValueTag;
+                }
+            };
+
+            pub const Value = union {
+                const_value_index: u16,
+
+                enum_const_value: struct {
+                    type_name_index: u16,
+                    const_name_index: u16,
+                },
+
+                class_info_index: u16,
+
+                // TODO(anas): re-check this
+                annotation: Annotation,
+
+                array_value: struct {
+                    // num_values: u16,
+                    values: []ElementValue,
+                },
+            };
+
+            pub fn read(reader: anytype, allocator: mem.Allocator) anyerror!ElementValue {
+                const tag = try Tag.from_u8(try reader.readByte());
+                const value: Value = switch (tag) {
+                    .Byte, .Char, .Double, .Float, .Int, .Long, .Short, .Boolean, .String => .{ .const_value_index = try reader.readInt(u16, .big) },
+                    .Enum => .{ .enum_const_value = .{
+                        .type_name_index = try reader.readInt(u16, .big),
+                        .const_name_index = try reader.readInt(u16, .big),
+                    } },
+                    .Class => .{ .class_info_index = try reader.readInt(u16, .big) },
+                    .Annotation => .{ .annotation = try Annotation.read(reader, allocator) },
+                    .Array => blk: {
+                        const num_values: u16 = try reader.readInt(u16, .big);
+                        var values = try allocator.alloc(ElementValue, num_values);
+                        errdefer allocator.free(values);
+                        for (0..num_values) |i| {
+                            values[i] = try ElementValue.read(reader, allocator);
+                        }
+                        break :blk .{ .array_value = .{ .values = values } };
+                    },
+                };
+                return .{ .tag = tag, .value = value };
+            }
+        };
+
+        pub inline fn read(reader: anytype, allocator: mem.Allocator) anyerror!ElementValuePair {
+            return .{
+                .element_name_index = try reader.readInt(u16, .big),
+                .value = try ElementValue.read(reader, allocator),
+            };
+        }
+    };
+
     pub fn read(reader: anytype, allocator: mem.Allocator, constant_pool: *const ConstantPool) !AttributeInfo {
         const name_index: u16 = try reader.readInt(u16, .big);
         const length = try reader.readInt(u32, .big);
@@ -658,7 +922,6 @@ pub const AttributeInfo = struct {
 
         var attribute: Attribute = undefined;
         const name = attr_name.utf8.bytes;
-        std.log.debug("AttributeInfo: name = {s}", .{name});
         if (mem.eql(u8, name, "ConstantValue")) {
             attribute = .{ .ConstantValue = .{
                 .constantvalue_index = try reader.readInt(u16, .big),
@@ -666,7 +929,7 @@ pub const AttributeInfo = struct {
         } else if (mem.eql(u8, name, "Code")) {
             // IMPORTANT(anas): do not forget to free this!
             var code = try allocator.create(CodeAttribute);
-            errdefer allocator.destroy(&code);
+            errdefer allocator.destroy(code);
             code.max_stack = try reader.readInt(u16, .big);
             code.max_locals = try reader.readInt(u16, .big);
 
@@ -801,8 +1064,6 @@ pub const AttributeInfo = struct {
             } };
         } else if (mem.eql(u8, name, "LocalVariableTable")) {
             const tlen: u16 = try reader.readInt(u16, .big);
-            std.log.debug("length: {d}", .{length});
-            std.log.debug("tlen: {d}", .{tlen});
             std.debug.assert(tlen * @sizeOf(LocalVariableEntry) == (length - 2));
             var table = try allocator.alloc(LocalVariableEntry, tlen);
             errdefer allocator.free(table);
@@ -818,6 +1079,21 @@ pub const AttributeInfo = struct {
             attribute = .{ .LocalVariableTable = .{
                 .local_variable_table = std.ArrayList(LocalVariableEntry).fromOwnedSlice(allocator, table),
             } };
+        } else if (mem.eql(u8, name, "Deprecated")) {
+            if (length > 0) return error.InvalidAttributeLength;
+            attribute = .{ .Deprecated = {} };
+        } else if (mem.eql(u8, name, "RuntimeVisibleAnnotations")) {
+            attribute = .{ .RuntimeVisibleAnnotations = try AnnotationsCollction.read(reader, allocator) };
+        } else if (mem.eql(u8, name, "RuntimeInvisibleAnnotations")) {
+            attribute = .{ .RuntimeInvisibleAnnotations = try AnnotationsCollction.read(reader, allocator) };
+        } else if (mem.eql(u8, name, "RuntimeVisibleParameterAnnotations")) {
+            attribute = .{
+                .RuntimeVisibleParameterAnnotations = try ParameterAnnotations.read(reader, allocator),
+            };
+        } else if (mem.eql(u8, name, "RuntimeInvisibleParameterAnnotations")) {
+            attribute = .{ .RuntimeInvisibleParameterAnnotations = try ParameterAnnotations.read(reader, allocator) };
+        } else if (mem.eql(u8, name, "RuntimeVisibleTypeAnnotations")) {
+            attribute = .{ .RuntimeVisibleTypeAnnotations = try TypeAnnotationsCollction.read(reader, allocator) };
         } else {
             std.log.warn("Unkown attribute: {s}", .{name});
             // IMPORTANT(anas): do not forget to free this!

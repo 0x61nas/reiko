@@ -10,7 +10,13 @@ pub fn main() !void {
     errdefer class_file.close();
     defer class_file.close();
     const reader = class_file.reader();
-    const allocator = std.heap.page_allocator;
+    var gpa = std.heap.DebugAllocator(.{}){};
+    const allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+    defer if (builtin.mode == .Debug) {
+        if (false and gpa.detectLeaks()) { // TODO(anas): re-enable this
+            std.posix.exit(1);
+        }
+    };
     const class = try lib.ClassFile.read(reader, allocator);
     defer class.deinit();
     errdefer class.deinit();
@@ -175,6 +181,7 @@ pub fn big_number_as_double(high_bytes: u32, low_bytes: u32) f64 {
 }
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fs = std.fs;
 
 /// This imports the separate module containing `root.zig`. Take a look in `build.zig` for details.
