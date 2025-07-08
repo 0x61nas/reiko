@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const mem = std.mem;
+const native_endian = @import("builtin").target.cpu.arch.endian();
 
 // magic: u32,
 minor_version: u16,
@@ -20,7 +21,7 @@ methods: Methods,
 // attributes_count: u16,
 attributes: Attributes,
 
-const Me = @This();
+const ClassFile = @This();
 
 // NOTE(anas): if we store them as slices it will be more efficient (probably), but we'll need to do alot of add, remove operations
 pub const Interfaces = std.ArrayList(u16);
@@ -51,89 +52,666 @@ pub const ACC_ANNOTATION: u16 = 0x2000; // Declared as an annotation interface.
 pub const ACC_ENUM: u16 = 0x4000; // Declared as an enum class.
 pub const ACC_MODULE: u16 = 0x8000; // Is a module, not a class or interface.
 
-pub fn read(reader: anytype, allocator: std.mem.Allocator) !Me {
-    // NOTE(anas): all multi-byte values are encoded as big-endian.
-    const magic = try reader.readInt(u32, .big);
-    if (magic != MAGIC) {
-        return error.InvalidClassFile;
-    }
-    const minor_version = try reader.readInt(u16, .big);
-    const major_version = try reader.readInt(u16, .big);
+/// The class file parser
+pub const Reader = struct {
+    bytes: []const u8,
+    cursor: usize = 0,
+    allocator: mem.Allocator,
 
-    const constant_pool_count: u16 = try reader.readInt(u16, .big);
-    var constant_pool = try ConstantPool.initCapacity(allocator, constant_pool_count);
-    errdefer constant_pool.deinit();
-    {
-        var i: usize = 0;
-        while (i < constant_pool_count - 1) {
-            const c = try ConstantInfo.read(reader, allocator);
-            // NOTE(anas): apparently the `constant_pool_count` counts the 8-bytes values as a two separate items.
-            // This done to keep the size of our `ConstantInfo` union 32bit
-            if (c == .long or c == .double) {
-                constant_pool.appendAssumeCapacity(c);
-                // read the second half of the big number
-                const low_bytes: u32 = try reader.readInt(u32, .big);
-                if (c == .long) {
-                    constant_pool.appendAssumeCapacity(.{ .long = .{ .low_bytes = low_bytes } });
-                } else {
-                    constant_pool.appendAssumeCapacity(.{ .double = .{ .low_bytes = low_bytes } });
-                }
-                i += 2;
-                continue;
-            }
-            constant_pool.appendAssumeCapacity(c);
-            i += 1;
+    pub inline fn init(allocator: mem.Allocator, bytes: []const u8) Reader {
+        return .{
+            .bytes = bytes,
+            .allocator = allocator,
+        };
+    }
+
+    inline fn _read_int(this: *Reader, comptime V: type) V {
+        // NOTE(anas): all multi-byte values are encoded as big-endian.
+        return mem.bigToNative(V, mem.bytesToValue(V, this.bytes[this.cursor..(blk: {
+            this.cursor += @sizeOf(V);
+            break :blk this.cursor;
+        })]));
+    }
+
+    fn read_u32(this: *Reader) u32 {
+        return this._read_int(u32);
+    }
+
+    fn read_u16(this: *Reader) u16 {
+        return this._read_int(u16);
+    }
+
+    fn read_u8(this: *Reader) u8 {
+        const n = this.bytes[this.cursor];
+        this.cursor += 1;
+        return n;
+    }
+
+    inline fn expect_n_bytes(this: *const Reader, n: usize) !void {
+        if (this.bytes.len - this.cursor < n) return error.NoEnughBytes;
+    }
+
+    inline fn _have_int(this: *const Reader, comptime V: type) bool {
+        const s = @sizeOf(V);
+        return (this.bytes.len - this.cursor) >= s;
+    }
+
+    fn have_u32(this: *const Reader) bool {
+        return this._have_int(u32);
+    }
+
+    fn have_u16(this: *const Reader) bool {
+        return this._have_int(u16);
+    }
+
+    fn have_u8(this: *const Reader) bool {
+        return this._have_int(u8);
+    }
+
+    inline fn _try_read_int(this: *Reader, comptime V: type) !V {
+        if (!this._have_int(V)) return error.UnExpectedEOF;
+        // NOTE(anas): all multi-byte values are encoded as big-endian.
+        return mem.bigToNative(V, mem.bytesToValue(V, this.bytes[this.cursor..(blk: {
+            this.cursor += @sizeOf(V);
+            break :blk this.cursor;
+        })]));
+    }
+
+    fn checked_read_u32(this: *Reader) !u32 {
+        return try this._try_read_int(u32);
+    }
+
+    fn checked_read_u16(this: *Reader) !u16 {
+        return try this._try_read_int(u16);
+    }
+
+    fn checked_read_u8(this: *Reader) !u8 {
+        return try this._try_read_int(u8);
+    }
+
+    inline fn fill_buff(this: *Reader, buf: []u8) !void {
+        try this.expect_n_bytes(buf.len);
+        @memcpy(buf, this.bytes[this.cursor..blk: {
+            this.cursor += buf.len;
+            break :blk this.cursor;
+        }]);
+    }
+
+    pub fn read_struct(this: *Reader, comptime T: type) !T {
+        // Only extern and packed structs have defined in-memory layout.
+        comptime std.debug.assert(@typeInfo(T).@"struct".layout != .auto);
+        var res: [1]T = undefined;
+        try this.fill_buff(mem.sliceAsBytes(res[0..]));
+        if (native_endian != .big) {
+            mem.byteSwapAllFields(T, &res[0]);
         }
+        return res[0];
     }
 
-    const access_flags: ClassAccessFlags = @bitCast(try reader.readInt(u16, .big));
-    const this_class = try reader.readInt(u16, .big);
-    const super_class = try reader.readInt(u16, .big);
-    std.log.debug("this_class {d}", .{this_class});
-
-    const interfaces_count: u16 = try reader.readInt(u16, .big);
-    var interfaces = try Interfaces.initCapacity(allocator, interfaces_count);
-    errdefer interfaces.deinit();
-    for (0..interfaces_count) |_| {
-        interfaces.appendAssumeCapacity(try reader.readInt(u16, .big));
+    /// Check if the inner bytes might represent a _somewhat_ valid class file.
+    /// You have to call this before `read_class` or do the initial length check on your side.
+    pub inline fn is_somewhat_valid(this: *Reader) bool {
+        // Check if it at least have the first 4 members
+        if (this.bytes.len < 10) return false;
+        const magic = this.read_u32();
+        if (magic != MAGIC) return false;
+        return true;
     }
 
-    const fields_count: u16 = try reader.readInt(u16, .big);
-    var fields = try Fields.initCapacity(allocator, fields_count);
-    errdefer fields.deinit();
-    for (0..fields_count) |_| {
-        fields.appendAssumeCapacity(try FieldInfo.read(reader, allocator, &constant_pool));
+    pub fn read_class(this: *Reader) !ClassFile {
+        // WARNING(anas): here we assume that the user has already checked that the inner bytes array has at least 10 bytes - 4 for the magic
+        const minor_version = this.read_u16();
+        const major_version = this.read_u16();
+
+        const constant_pool_count: u16 = this.read_u16();
+        var constant_pool = try ConstantPool.initCapacity(this.allocator, constant_pool_count);
+        errdefer constant_pool.deinit();
+        {
+            var i: usize = 0;
+            while (i < constant_pool_count - 1) {
+                // const c = try ConstantInfo.read(reader, this.allocator);
+                const c = try this.read_constant_info();
+                // NOTE(anas): apparently the `constant_pool_count` counts the 8-bytes values as a two separate items.
+                // This done to keep the size of our `ConstantInfo` union 32bit
+                if (c == .long or c == .double) {
+                    constant_pool.appendAssumeCapacity(c);
+                    // read the second half of the big number
+                    const low_bytes: u32 = try this.checked_read_u32();
+                    if (c == .long) {
+                        constant_pool.appendAssumeCapacity(.{ .long = .{ .low_bytes = low_bytes } });
+                    } else {
+                        constant_pool.appendAssumeCapacity(.{ .double = .{ .low_bytes = low_bytes } });
+                    }
+                    i += 2;
+                    continue;
+                }
+                constant_pool.appendAssumeCapacity(c);
+                i += 1;
+            }
+        }
+
+        try this.expect_n_bytes(@sizeOf(u16) * 4);
+        const access_flags: ClassAccessFlags = @bitCast(this.read_u16());
+        const this_class = this.read_u16();
+        const super_class = this.read_u16();
+        const interfaces_count: u16 = this.read_u16();
+        try this.expect_n_bytes(@sizeOf(u16) * interfaces_count);
+        var interfaces = try Interfaces.initCapacity(this.allocator, interfaces_count);
+        errdefer interfaces.deinit();
+        for (0..interfaces_count) |_| {
+            interfaces.appendAssumeCapacity(this.read_u16());
+        }
+
+        const fields_count: u16 = try this.checked_read_u16();
+        var fields = try Fields.initCapacity(this.allocator, fields_count);
+        errdefer fields.deinit();
+        for (0..fields_count) |_| {
+            fields.appendAssumeCapacity(try this.read_field_info(&constant_pool));
+        }
+
+        const methods_count: u16 = try this.checked_read_u16();
+        var methods = try Methods.initCapacity(this.allocator, methods_count);
+        errdefer methods.deinit();
+        for (0..methods_count) |_| {
+            methods.appendAssumeCapacity(try this.read_method_info(&constant_pool));
+        }
+
+        const attributes_count = try this.checked_read_u16();
+        var attributes = try Attributes.initCapacity(this.allocator, attributes_count);
+        errdefer attributes.deinit();
+        for (0..attributes_count) |_| {
+            attributes.appendAssumeCapacity(try this.read_attribute_info(&constant_pool));
+        }
+
+        return .{
+            .minor_version = minor_version,
+            .major_version = major_version,
+            .constant_pool = constant_pool,
+            .access_flags = access_flags,
+            .this_class = this_class,
+            .super_class = super_class,
+            .interfaces = interfaces,
+            .fields = fields,
+            .methods = methods,
+            .attributes = attributes,
+        };
     }
 
-    const methods_count: u16 = try reader.readInt(u16, .big);
-    var methods = try Methods.initCapacity(allocator, methods_count);
-    errdefer methods.deinit();
-    for (0..methods_count) |_| {
-        methods.appendAssumeCapacity(try MethodInfo.read(reader, allocator, &constant_pool));
+    fn read_constant_info(this: *Reader) !ConstantInfo {
+        if (!this.have_u8()) return error.UnExpectedEOF;
+        const tag = try ConstantInfo.Tag.from_u8(this.read_u8());
+        if (!this.have_u16()) return error.UnExpectedEOF;
+        return switch (tag) {
+            .class => .{ .class = .{ .name_index = this.read_u16() } },
+            .fieldref => .{ .fieldref = .{
+                .class_index = this.read_u16(),
+                .name_and_type_index = try this.checked_read_u16(),
+            } },
+            .methodref => .{ .methodref = .{
+                .class_index = this.read_u16(),
+                .name_and_type_index = try this.checked_read_u16(),
+            } },
+            .interface_methodref => .{ .interface_methodref = .{
+                .class_index = this.read_u16(),
+                .name_and_type_index = try this.checked_read_u16(),
+            } },
+            .string => .{ .string = .{
+                .string_index = this.read_u16(),
+            } },
+            .integer => .{ .integer = .{
+                .bytes = try this.checked_read_u32(),
+            } },
+            .float => .{ .float = .{
+                .bytes = try this.checked_read_u32(),
+            } },
+            .long => .{ .long = .{
+                .high_bytes = try this.checked_read_u32(),
+            } },
+            .double => .{
+                .double = .{
+                    .high_bytes = try this.checked_read_u32(),
+                },
+            },
+            .name_and_type => .{ .name_and_type = .{
+                .name_index = this.read_u16(),
+                .descriptor_index = try this.checked_read_u16(),
+            } },
+            .utf8 => blk: {
+                const length = this.read_u16();
+                const bytes = try this.allocator.alloc(u8, length);
+                errdefer this.allocator.free(bytes);
+                try this.fill_buff(bytes);
+                break :blk .{ .utf8 = .{
+                    .bytes = bytes,
+                } };
+            },
+            .method_handle => .{ .method_handle = .{
+                .refrence_kind = try ConstantInfo.MethodRefKind.from_u8(this.read_u8()),
+                .refrence_index = try this.checked_read_u16(),
+            } },
+            .method_type => .{ .method_type = .{
+                .descriptor_index = this.read_u16(),
+            } },
+            .dynamic => .{ .dynamic = .{
+                .bootstrap_method_attr_index = this.read_u16(),
+                .name_and_type_index = try this.checked_read_u16(),
+            } },
+            .invoke_dynamic => .{ .invoke_dynamic = .{
+                .bootstrap_method_attr_index = this.read_u16(),
+                .name_and_type_index = try this.checked_read_u16(),
+            } },
+            .module => .{ .module = .{
+                .name_index = this.read_u16(),
+            } },
+            .package => .{ .package = .{
+                .name_index = this.read_u16(),
+            } },
+        };
     }
 
-    const attributes_count = try reader.readInt(u16, .big);
-    var attributes = try Attributes.initCapacity(allocator, attributes_count);
-    errdefer attributes.deinit();
-    for (0..attributes_count) |_| {
-        attributes.appendAssumeCapacity(try AttributeInfo.read(reader, allocator, &constant_pool));
+    fn read_field_info(this: *Reader, constant_pool: *const ConstantPool) !FieldInfo {
+        try this.expect_n_bytes(@sizeOf(u16) * 4);
+        const access_flags: FieldAccessFlags = @bitCast(this.read_u16());
+        const name_index = this.read_u16();
+        const descriptor_index = this.read_u16();
+        const attributes_count: u16 = this.read_u16();
+        var attributes = try Attributes.initCapacity(this.allocator, attributes_count);
+        errdefer attributes.deinit();
+        for (0..attributes_count) |_| {
+            attributes.appendAssumeCapacity(try this.read_attribute_info(constant_pool));
+        }
+
+        return .{
+            .access_flags = access_flags,
+            .name_index = name_index,
+            .descriptor_index = descriptor_index,
+            .attributes = attributes,
+        };
     }
 
-    return .{
-        .minor_version = minor_version,
-        .major_version = major_version,
-        .constant_pool = constant_pool,
-        .access_flags = access_flags,
-        .this_class = this_class,
-        .super_class = super_class,
-        .interfaces = interfaces,
-        .fields = fields,
-        .methods = methods,
-        .attributes = attributes,
-    };
-}
+    pub fn read_attribute_info(this: *Reader, constant_pool: *const ConstantPool) !AttributeInfo {
+        try this.expect_n_bytes(@sizeOf(u16) + @sizeOf(u32));
+        const name_index: u16 = this.read_u16();
+        const length = this.read_u32();
+        const attr_name = try constant_pool.at_checked(name_index);
+        if (attr_name != .utf8) return error.AttributeNameMustBeUTF8;
 
-pub fn deinit(me: Me) void {
+        var attribute: AttributeInfo.Attribute = undefined;
+        const name = attr_name.utf8.bytes;
+        if (mem.eql(u8, name, "ConstantValue")) {
+            attribute = .{ .ConstantValue = .{
+                .constantvalue_index = try this.checked_read_u16(),
+            } };
+        } else if (mem.eql(u8, name, "Code")) {
+            // IMPORTANT(anas): do not forget to free this!
+            var code = try this.allocator.create(AttributeInfo.CodeAttribute);
+            errdefer this.allocator.destroy(code);
+            try this.expect_n_bytes(@sizeOf(u16) * 2 + @sizeOf(u32));
+            code.max_stack = this.read_u16();
+            code.max_locals = this.read_u16();
+
+            const code_length: u32 = this.read_u32();
+            const code_bytes = try this.allocator.alloc(u8, code_length);
+            errdefer this.allocator.free(code_bytes);
+            try this.fill_buff(code_bytes);
+            code.code = std.ArrayList(u8).fromOwnedSlice(this.allocator, code_bytes);
+
+            const exception_table_length: u16 = try this.checked_read_u16();
+            var exception_table = try std.ArrayList(AttributeInfo.CodeAttribute.ExceptionTableEntry).initCapacity(this.allocator, exception_table_length);
+            errdefer exception_table.deinit();
+            for (0..exception_table_length) |_| {
+                exception_table.appendAssumeCapacity(try this.read_struct(AttributeInfo.CodeAttribute.ExceptionTableEntry));
+            }
+            code.exception_table = exception_table;
+
+            const attributes_count: u16 = try this.checked_read_u16();
+            var attributes = try Attributes.initCapacity(this.allocator, attributes_count);
+            errdefer attributes.deinit();
+            for (0..attributes_count) |_| {
+                // NOTE(anas): Should we use a separate method for the code attributes?
+                // See: Table 4.7-C. https://docs.oracle.com/javase/specs/jvms/se24/html/jvms-4.html#jvms-4.7-320
+                attributes.appendAssumeCapacity(try this.read_attribute_info(constant_pool));
+            }
+            code.attributes = attributes;
+
+            attribute = .{ .Code = code };
+        } else if (mem.eql(u8, name, "StackMapTable")) {
+            const number_of_entries: u16 = try this.checked_read_u16();
+            var entries = try std.ArrayList(AttributeInfo.StackMapFrame).initCapacity(this.allocator, number_of_entries);
+            errdefer entries.deinit();
+            for (0..number_of_entries) |_| {
+                const frame_type: u8 = try this.checked_read_u8();
+                switch (frame_type) {
+                    0...63 => entries.appendAssumeCapacity(.{ .same_frame = .{ .frame_type = frame_type } }),
+                    64...127 => entries.appendAssumeCapacity(.{ .same_locals_1_stack_item_frame = .{
+                        .frame_type = frame_type,
+                        .stack = .{try this.read_verification_type_info()},
+                    } }),
+                    247 => entries.appendAssumeCapacity(.{ .same_locals_1_stack_item_frame_extended = .{
+                        .offset_delta = try this.checked_read_u16(),
+                        .stack = .{try this.read_verification_type_info()},
+                    } }),
+                    248...250 => entries.appendAssumeCapacity(.{
+                        .chop_frame = .{ .frame_type = frame_type, .offset_delta = try this.checked_read_u16() },
+                    }),
+                    251 => entries.appendAssumeCapacity(.{
+                        .same_frame_extended = .{ .offset_delta = try this.checked_read_u16() },
+                    }),
+                    252...254 => entries.appendAssumeCapacity(.{ .append_frame = .{
+                        .frame_type = frame_type,
+                        .offset_delta = try this.checked_read_u16(),
+                        .locals = blk: {
+                            var locals = try this.allocator.alloc(VerificationTypeInfo, frame_type - 251);
+                            errdefer this.allocator.free(locals);
+                            for (0..(frame_type - 251)) |i| {
+                                locals[i] = try this.read_verification_type_info();
+                            }
+                            break :blk locals;
+                        },
+                    } }),
+                    255 => entries.appendAssumeCapacity(.{ .full_frame = .{ .offset_delta = try this.checked_read_u16(), .locals = blk: {
+                        const number_of_locals: u16 = try this.checked_read_u16();
+                        var locals = try std.ArrayList(VerificationTypeInfo).initCapacity(this.allocator, number_of_locals);
+                        errdefer locals.deinit();
+                        for (0..number_of_locals) |_| {
+                            locals.appendAssumeCapacity(try this.read_verification_type_info());
+                        }
+                        break :blk locals;
+                    }, .stack = blk: {
+                        const number_of_stack_items: u16 = try this.checked_read_u16();
+                        var stack = try std.ArrayList(VerificationTypeInfo).initCapacity(this.allocator, number_of_stack_items);
+                        errdefer stack.deinit();
+                        for (0..number_of_stack_items) |_| {
+                            stack.appendAssumeCapacity(try this.read_verification_type_info());
+                        }
+                        break :blk stack;
+                    } } }),
+                    else => {
+                        // TODO(anas): return error?
+                        std.log.err("Unkown stack map frame tag", .{});
+                    },
+                }
+            }
+            attribute = .{ .StackMapTable = .{ .entries = entries } };
+        } else if (mem.eql(u8, name, "Exceptions")) {
+            const number_of_exceptions: u16 = try this.checked_read_u16();
+            // TEST(anas): we are not sure if this way is more optimal than the pre allocated ArrayList way
+            var entries = try this.allocator.alloc(u16, number_of_exceptions);
+            errdefer this.allocator.free(entries);
+            try this.expect_n_bytes(@sizeOf(u16) * number_of_exceptions);
+            for (0..number_of_exceptions) |i| {
+                entries[i] = this.read_u16();
+            }
+            attribute = .{ .Exceptions = .{ .exception_index_table = std.ArrayList(u16).fromOwnedSlice(this.allocator, entries) } };
+        } else if (mem.eql(u8, name, "InnerClasses")) {
+            const number_of_classes: u16 = try this.checked_read_u16();
+            var classes = try this.allocator.alloc(AttributeInfo.InnerClass, number_of_classes);
+            errdefer this.allocator.free(classes);
+            for (0..number_of_classes) |i| {
+                classes[i] = try this.read_struct(AttributeInfo.InnerClass);
+            }
+            attribute = .{ .InnerClasses = .{ .classes = std.ArrayList(AttributeInfo.InnerClass).fromOwnedSlice(this.allocator, classes) } };
+        } else if (mem.eql(u8, name, "EnclosingMethod")) {
+            try this.expect_n_bytes(@sizeOf(u16) * 2);
+            attribute = .{ .EnclosingMethod = .{
+                .class_index = this.read_u16(),
+                .method_index = this.read_u16(),
+            } };
+        } else if (mem.eql(u8, name, "Synthetic")) {
+            if (length != 0) return error.InvalidAttributeLength;
+            attribute = .{ .Synthetic = {} };
+        } else if (mem.eql(u8, name, "Signature")) {
+            attribute = .{ .Signature = .{ .signature_index = try this.checked_read_u16() } };
+        } else if (mem.eql(u8, name, "SourceFile")) {
+            attribute = .{ .SourceFile = .{ .sourcefile_index = try this.checked_read_u16() } };
+        } else if (mem.eql(u8, name, "SourceDebugExtension")) {
+            const debug_extension = try this.allocator.alloc(u8, length);
+            errdefer this.allocator.free(debug_extension);
+            try this.fill_buff(debug_extension);
+            attribute = .{ .SourceDebugExtension = .{ .debug_extension = debug_extension } };
+        } else if (mem.eql(u8, name, "LineNumberTable")) {
+            const tlen: u16 = try this.checked_read_u16();
+            std.debug.assert(tlen * @sizeOf(AttributeInfo.LineNumberEntry) == (length - 2));
+            var table = try this.allocator.alloc(AttributeInfo.LineNumberEntry, tlen);
+            errdefer this.allocator.free(table);
+            for (0..tlen) |i| {
+                table[i] = try this.read_struct(AttributeInfo.LineNumberEntry);
+            }
+            attribute = .{ .LineNumberTable = .{
+                .line_number_table = std.ArrayList(AttributeInfo.LineNumberEntry).fromOwnedSlice(this.allocator, table),
+            } };
+        } else if (mem.eql(u8, name, "LocalVariableTable")) {
+            const tlen: u16 = try this.checked_read_u16();
+            std.debug.assert(tlen * @sizeOf(AttributeInfo.LocalVariableEntry) == (length - 2));
+            var table = try this.allocator.alloc(AttributeInfo.LocalVariableEntry, tlen);
+            errdefer this.allocator.free(table);
+            try this.expect_n_bytes(@sizeOf(AttributeInfo.LocalVariableEntry) * tlen);
+            for (0..tlen) |i| {
+                table[i] = .{
+                    .start_pc = this.read_u16(),
+                    .length = this.read_u16(),
+                    .name_index = this.read_u16(),
+                    .descriptor_index = this.read_u16(),
+                    .index = this.read_u16(),
+                };
+            }
+            attribute = .{ .LocalVariableTable = .{
+                .local_variable_table = std.ArrayList(AttributeInfo.LocalVariableEntry).fromOwnedSlice(this.allocator, table),
+            } };
+        } else if (mem.eql(u8, name, "Deprecated")) {
+            if (length > 0) return error.InvalidAttributeLength;
+            attribute = .{ .Deprecated = {} };
+        } else if (mem.eql(u8, name, "RuntimeVisibleAnnotations")) {
+            attribute = .{ .RuntimeVisibleAnnotations = try this.read_annotations_collection() };
+        } else if (mem.eql(u8, name, "RuntimeInvisibleAnnotations")) {
+            attribute = .{ .RuntimeInvisibleAnnotations = try this.read_annotations_collection() };
+        } else if (mem.eql(u8, name, "RuntimeVisibleParameterAnnotations")) {
+            attribute = .{
+                .RuntimeVisibleParameterAnnotations = try this.read_parameter_annotations(),
+            };
+        } else if (mem.eql(u8, name, "RuntimeInvisibleParameterAnnotations")) {
+            attribute = .{ .RuntimeInvisibleParameterAnnotations = try this.read_parameter_annotations() };
+        } else if (mem.eql(u8, name, "RuntimeVisibleTypeAnnotations")) {
+            attribute = .{ .RuntimeVisibleTypeAnnotations = try this.read_type_annotations_collection() };
+        } else {
+            std.log.warn("Unkown attribute: {s}", .{name});
+            // IMPORTANT(anas): do not forget to free this!
+            const bytes = try this.allocator.alloc(u8, length);
+            errdefer this.allocator.free(bytes);
+            try this.fill_buff(bytes);
+            attribute = .{ .Unkown = std.ArrayList(u8).fromOwnedSlice(this.allocator, bytes) };
+        }
+
+        return .{
+            .name_index = name_index,
+            .info = attribute,
+        };
+    }
+
+    pub fn read_verification_type_info(this: *Reader) !VerificationTypeInfo {
+        const tag = try VerificationTypeInfo.Tag.from_u8(try this.checked_read_u8());
+        return switch (tag) {
+            .Top_variable_info => .{ .Top_variable_info = {} },
+            .Integer_variable_info => .{ .Integer_variable_info = {} },
+            .Float_variable_info => .{ .Float_variable_info = {} },
+            .Long_variable_info => .{ .Long_variable_info = {} },
+            .Double_variable_info => .{ .Double_variable_info = {} },
+            .Null_variable_info => .{ .Null_variable_info = {} },
+            .UninitializedThis_variable_info => .{ .UninitializedThis_variable_info = {} },
+            .Object_variable_info => .{ .Object_variable_info = .{
+                .cpool_index = try this.checked_read_u16(),
+            } },
+            .Uninitialized_variable_info => .{ .Uninitialized_variable_info = .{
+                .offset = try this.checked_read_u16(),
+            } },
+        };
+    }
+
+    inline fn read_annotations_collection(this: *Reader) !AttributeInfo.AnnotationsCollction {
+        const tlen: u16 = try this.checked_read_u16();
+        var table = try this.allocator.alloc(AttributeInfo.Annotation, tlen);
+        errdefer this.allocator.free(table);
+        for (0..tlen) |i| {
+            table[i] = try this.read_annotation();
+        }
+        return .{ .annotations = table };
+    }
+
+    fn read_annotation(this: *Reader) anyerror!AttributeInfo.Annotation {
+        try this.expect_n_bytes(@sizeOf(u16) * 2);
+        const type_index: u16 = this.read_u16();
+        const num_element_value_pairs: u16 = this.read_u16();
+        var element_value_pairs = try this.allocator.alloc(AttributeInfo.ElementValuePair, num_element_value_pairs);
+        errdefer this.allocator.free(element_value_pairs);
+        for (0..num_element_value_pairs) |i| {
+            element_value_pairs[i] = try this.read_element_value_pair();
+        }
+        return .{ .type_index = type_index, .element_value_pairs = element_value_pairs };
+    }
+
+    inline fn read_element_value_pair(this: *Reader) anyerror!AttributeInfo.ElementValuePair {
+        return .{
+            .element_name_index = try this.checked_read_u16(),
+            .value = try this.read_element_value(),
+        };
+    }
+
+    fn read_element_value(this: *Reader) anyerror!AttributeInfo.ElementValuePair.ElementValue {
+        const ElementValue = AttributeInfo.ElementValuePair.ElementValue;
+        const tag = try ElementValue.Tag.from_u8(try this.checked_read_u8());
+        const value: ElementValue.Value = switch (tag) {
+            .Byte, .Char, .Double, .Float, .Int, .Long, .Short, .Boolean, .String => .{ .const_value_index = try this.checked_read_u16() },
+            .Enum => .{ .enum_const_value = blk: {
+                try this.expect_n_bytes(@sizeOf(u16) * 2);
+                break :blk .{
+                    .type_name_index = this.read_u16(),
+                    .const_name_index = this.read_u16(),
+                };
+            } },
+            .Class => .{ .class_info_index = try this.checked_read_u16() },
+            .Annotation => .{ .annotation = try this.read_annotation() },
+            .Array => blk: {
+                const num_values: u16 = try this.checked_read_u16();
+                var values = try this.allocator.alloc(ElementValue, num_values);
+                errdefer this.allocator.free(values);
+                for (0..num_values) |i| {
+                    values[i] = try this.read_element_value();
+                }
+                break :blk .{ .array_value = .{ .values = values } };
+            },
+        };
+        return .{ .tag = tag, .value = value };
+    }
+
+    inline fn read_parameter_annotations(this: *Reader) !AttributeInfo.ParameterAnnotations {
+        const num_parameters: u8 = try this.checked_read_u8();
+        var ptaple = try this.allocator.alloc(AttributeInfo.AnnotationsCollction, num_parameters);
+        errdefer this.allocator.free(ptaple);
+        for (0..num_parameters) |i| {
+            ptaple[i] = try this.read_annotations_collection();
+        }
+        return .{ .parameter_annotations = ptaple };
+    }
+
+    inline fn read_type_annotations_collection(this: *Reader) !AttributeInfo.TypeAnnotationsCollction {
+        const tlen: u16 = try this.checked_read_u16();
+        // std.debug.assert(tlen * @sizeOf(Annotation) == (length - 2));
+        var table = try this.allocator.alloc(AttributeInfo.TypeAnnotation, tlen);
+        errdefer this.allocator.free(table);
+        for (0..tlen) |i| {
+            table[i] = try this.read_type_annotation();
+        }
+        return .{ .annotations = table };
+    }
+
+    fn read_type_annotation(this: *Reader) !AttributeInfo.TypeAnnotation {
+        var type_ann: AttributeInfo.TypeAnnotation = undefined;
+        const target_tag: u8 = try this.checked_read_u8();
+        type_ann.target_tag = target_tag;
+        type_ann.target_info = switch (target_tag) {
+            0x00, 0x01 => .{ .type_parameter_target = .{ .type_parameter_index = try this.checked_read_u8() } },
+            0x10 => .{ .supertype_target = .{ .supertype_index = try this.checked_read_u16() } },
+            0x11, 0x12 => .{ .type_parameter_bound_target = blk: {
+                try this.expect_n_bytes(2);
+                break :blk .{
+                    .type_parameter_index = this.read_u8(),
+                    .bound_index = this.read_u8(),
+                };
+            } },
+            0x13, 0x14, 0x15 => .{ .empty_target = {} },
+            0x16 => .{ .formal_parameter_target = .{ .formal_parameter_index = try this.checked_read_u8() } },
+            0x17 => .{ .throws_target = .{ .throws_type_index = try this.checked_read_u16() } },
+            0x40, 0x41 => .{
+                .localvar_target = blk: {
+                    const tlen: u16 = try this.checked_read_u16();
+                    var table = try this.allocator.alloc(AttributeInfo.TypeAnnotation.LocalVarTableEntry, tlen);
+                    errdefer this.allocator.free(table);
+                    try this.expect_n_bytes(@sizeOf(AttributeInfo.TypeAnnotation.LocalVarTableEntry) * tlen);
+                    for (0..tlen) |i| {
+                        // TODO(anas): here `read_struct` do a duplicated length check
+                        table[i] = try this.read_struct(AttributeInfo.TypeAnnotation.LocalVarTableEntry);
+                    }
+                    break :blk .{ .table = table };
+                },
+            },
+            0x42 => .{ .catch_target = .{ .exception_table_index = try this.checked_read_u16() } },
+            0x43...0x46 => .{ .offset_target = .{ .offset = try this.checked_read_u16() } },
+            0x47...0x4B => .{
+                .type_argument_target = blk: {
+                    // why i am so alone?
+                    try this.expect_n_bytes(@sizeOf(u16) + 1);
+                    break :blk .{
+                        .offset = this.read_u16(),
+                        .type_argument_index = this.read_u8(),
+                    };
+                },
+            },
+            else => return error.InvalidTargetTag,
+        };
+        type_ann.target_path = try this.read_target_path();
+        try this.expect_n_bytes(@sizeOf(u16) * 2);
+        type_ann.type_index = this.read_u16();
+        const num_element_value_pairs: u16 = this.read_u16();
+        var element_value_pairs = try this.allocator.alloc(AttributeInfo.ElementValuePair, num_element_value_pairs);
+        errdefer this.allocator.free(element_value_pairs);
+        for (0..num_element_value_pairs) |i| {
+            element_value_pairs[i] = try this.read_element_value_pair();
+        }
+        type_ann.element_value_pairs = element_value_pairs;
+        return type_ann;
+    }
+
+    inline fn read_target_path(this: *Reader) !AttributeInfo.TargetPath {
+        const len: u8 = try this.checked_read_u8();
+        var path = try this.allocator.alloc(AttributeInfo.TargetPath.PathEntry, len);
+        errdefer this.allocator.free(path);
+        try this.expect_n_bytes(@sizeOf(AttributeInfo.TargetPath.PathEntry) * len);
+        for (0..len) |i| {
+            path[i] = .{
+                .type_path_kind = this.read_u8(),
+                .type_argument_index = this.read_u8(),
+            };
+        }
+        return .{ .path = path };
+    }
+
+    fn read_method_info(this: *Reader, constant_pool: *const ConstantPool) !MethodInfo {
+        try this.expect_n_bytes(@sizeOf(u16) * 4);
+        const access_flags: MethodAccessFlags = @bitCast(this.read_u16());
+        const name_index: u16 = this.read_u16();
+        const descriptor_index: u16 = this.read_u16();
+        const attributes_count: u16 = this.read_u16();
+        var attributes = try Attributes.initCapacity(this.allocator, attributes_count);
+        errdefer attributes.deinit();
+        for (0..attributes_count) |_| {
+            attributes.appendAssumeCapacity(try this.read_attribute_info(constant_pool));
+        }
+
+        return .{ .access_flags = access_flags, .name_index = name_index, .descriptor_index = descriptor_index, .attributes = attributes };
+    }
+};
+
+pub fn deinit(me: ClassFile) void {
     _ = me;
     // TODO(anas): de-allocate all stuff
 }
@@ -332,78 +910,6 @@ pub const ConstantInfo = union(ConstantInfo.Tag) {
         bootstrap_method_attr_index: u16,
         name_and_type_index: u16,
     };
-
-    pub fn read(reader: anytype, allocator: std.mem.Allocator) !ConstantInfo {
-        const tag = try Tag.from_u8(try reader.readByte());
-        return switch (tag) {
-            .class => .{ .class = .{ .name_index = try reader.readInt(u16, .big) } },
-            .fieldref => .{ .fieldref = .{
-                .class_index = try reader.readInt(u16, .big),
-                .name_and_type_index = try reader.readInt(u16, .big),
-            } },
-            .methodref => .{ .methodref = .{
-                .class_index = try reader.readInt(u16, .big),
-                .name_and_type_index = try reader.readInt(u16, .big),
-            } },
-            .interface_methodref => .{ .interface_methodref = .{
-                .class_index = try reader.readInt(u16, .big),
-                .name_and_type_index = try reader.readInt(u16, .big),
-            } },
-            .string => .{ .string = .{
-                .string_index = try reader.readInt(u16, .big),
-            } },
-            .integer => .{ .integer = .{
-                .bytes = try reader.readInt(u32, .big),
-            } },
-            .float => .{ .float = .{
-                .bytes = try reader.readInt(u32, .big),
-            } },
-            .long => .{ .long = .{
-                .high_bytes = try reader.readInt(u32, .big),
-            } },
-            .double => .{
-                .double = .{
-                    .high_bytes = try reader.readInt(u32, .big),
-                },
-            },
-            .name_and_type => .{ .name_and_type = .{
-                .name_index = try reader.readInt(u16, .big),
-                .descriptor_index = try reader.readInt(u16, .big),
-            } },
-            .utf8 => blk: {
-                const length = try reader.readInt(u16, .big);
-                const bytes = try allocator.alloc(u8, length);
-                errdefer allocator.free(bytes);
-                // TEST(anas): make sure that this function returns an error when there is no enough bytes
-                const readen = try reader.readAtLeast(bytes, length);
-                std.debug.assert(readen == length);
-                break :blk .{ .utf8 = .{
-                    .bytes = bytes,
-                } };
-            },
-            .method_handle => .{ .method_handle = .{
-                .refrence_kind = try MethodRefKind.from_u8(try reader.readByte()),
-                .refrence_index = try reader.readInt(u16, .big),
-            } },
-            .method_type => .{ .method_type = .{
-                .descriptor_index = try reader.readInt(u16, .big),
-            } },
-            .dynamic => .{ .dynamic = .{
-                .bootstrap_method_attr_index = try reader.readInt(u16, .big),
-                .name_and_type_index = try reader.readInt(u16, .big),
-            } },
-            .invoke_dynamic => .{ .invoke_dynamic = .{
-                .bootstrap_method_attr_index = try reader.readInt(u16, .big),
-                .name_and_type_index = try reader.readInt(u16, .big),
-            } },
-            .module => .{ .module = .{
-                .name_index = try reader.readInt(u16, .big),
-            } },
-            .package => .{ .package = .{
-                .name_index = try reader.readInt(u16, .big),
-            } },
-        };
-    }
 };
 
 pub const FieldInfo = struct {
@@ -412,26 +918,6 @@ pub const FieldInfo = struct {
     descriptor_index: u16,
     // attributes_count: u16,
     attributes: Attributes,
-
-    fn read(reader: anytype, allocator: mem.Allocator, constant_pool: *const ConstantPool) !FieldInfo {
-        const access_flags: FieldAccessFlags = @bitCast(try reader.readInt(u16, .big));
-        const name_index = try reader.readInt(u16, .big);
-        const descriptor_index = try reader.readInt(u16, .big);
-
-        const attributes_count: u16 = try reader.readInt(u16, .big);
-        var attributes = try Attributes.initCapacity(allocator, attributes_count);
-        errdefer attributes.deinit();
-        for (0..attributes_count) |_| {
-            attributes.appendAssumeCapacity(try AttributeInfo.read(reader, allocator, constant_pool));
-        }
-
-        return .{
-            .access_flags = access_flags,
-            .name_index = name_index,
-            .descriptor_index = descriptor_index,
-            .attributes = attributes,
-        };
-    }
 };
 
 pub const FieldAccessFlags = packed struct(u16) {
@@ -469,21 +955,6 @@ pub const MethodInfo = struct {
     descriptor_index: u16,
     // attributes_count: u16,
     attributes: Attributes,
-
-    pub fn read(reader: anytype, allocator: mem.Allocator, constant_pool: *const ConstantPool) !MethodInfo {
-        const access_flags: MethodAccessFlags = @bitCast(try reader.readInt(u16, .big));
-        const name_index: u16 = try reader.readInt(u16, .big);
-        const descriptor_index: u16 = try reader.readInt(u16, .big);
-
-        const attributes_count: u16 = try reader.readInt(u16, .big);
-        var attributes = try Attributes.initCapacity(allocator, attributes_count);
-        errdefer attributes.deinit();
-        for (0..attributes_count) |_| {
-            attributes.appendAssumeCapacity(try AttributeInfo.read(reader, allocator, constant_pool));
-        }
-
-        return .{ .access_flags = access_flags, .name_index = name_index, .descriptor_index = descriptor_index, .attributes = attributes };
-    }
 };
 
 pub const MethodAccessFlags = packed struct(u16) {
@@ -650,6 +1121,7 @@ pub const AttributeInfo = struct {
         line_number: u16,
     };
 
+    // NOTE(anas): we can't pack this struct because its size aren't even
     pub const LocalVariableEntry = struct {
         start_pc: u16,
         length: u16,
@@ -665,32 +1137,11 @@ pub const AttributeInfo = struct {
         // NOTE(anas): I don't think that the user will play alot with the annotations, so no need to pay the ArrayList cost
         // we should also reconsider our decision in using ArrayList in other parts, because i don't think we'll modify the Class object directly anyway
         annotations: []Annotation,
-
-        pub inline fn read(reader: anytype, allocator: mem.Allocator) !AnnotationsCollction {
-            const tlen: u16 = try reader.readInt(u16, .big);
-            // std.debug.assert(tlen * @sizeOf(Annotation) == (length - 2));
-            var table = try allocator.alloc(Annotation, tlen);
-            errdefer allocator.free(table);
-            for (0..tlen) |i| {
-                table[i] = try Annotation.read(reader, allocator);
-            }
-            return .{ .annotations = table };
-        }
     };
 
     pub const ParameterAnnotations = struct {
         // u1 num_parameters;
         parameter_annotations: []AnnotationsCollction,
-
-        pub inline fn read(reader: anytype, allocator: mem.Allocator) !ParameterAnnotations {
-            const num_parameters: u8 = try reader.readByte();
-            var ptaple = try allocator.alloc(AnnotationsCollction, num_parameters);
-            errdefer allocator.free(ptaple);
-            for (0..num_parameters) |i| {
-                ptaple[i] = try AnnotationsCollction.read(reader, allocator);
-            }
-            return .{ .parameter_annotations = ptaple };
-        }
     };
 
     pub const Annotation = struct {
@@ -698,33 +1149,11 @@ pub const AttributeInfo = struct {
         type_index: u16,
         // num_element_value_pairs: u16,
         element_value_pairs: []ElementValuePair,
-
-        pub fn read(reader: anytype, allocator: mem.Allocator) anyerror!Annotation {
-            const type_index: u16 = try reader.readInt(u16, .big);
-            const num_element_value_pairs: u16 = try reader.readInt(u16, .big);
-            var element_value_pairs = try allocator.alloc(ElementValuePair, num_element_value_pairs);
-            errdefer allocator.free(element_value_pairs);
-            for (0..num_element_value_pairs) |i| {
-                element_value_pairs[i] = try ElementValuePair.read(reader, allocator);
-            }
-            return .{ .type_index = type_index, .element_value_pairs = element_value_pairs };
-        }
     };
 
     pub const TypeAnnotationsCollction = struct {
         // u2              num_annotations;
         annotations: []TypeAnnotation,
-
-        pub inline fn read(reader: anytype, allocator: mem.Allocator) !TypeAnnotationsCollction {
-            const tlen: u16 = try reader.readInt(u16, .big);
-            // std.debug.assert(tlen * @sizeOf(Annotation) == (length - 2));
-            var table = try allocator.alloc(TypeAnnotation, tlen);
-            errdefer allocator.free(table);
-            for (0..tlen) |i| {
-                table[i] = try TypeAnnotation.read(reader, allocator);
-            }
-            return .{ .annotations = table };
-        }
     };
 
     pub const TypeAnnotation = struct {
@@ -763,49 +1192,6 @@ pub const AttributeInfo = struct {
             // If the local variable at index is of type double or long, it occupies both index and index + 1.
             index: u16,
         };
-
-        pub fn read(reader: anytype, allocator: mem.Allocator) !TypeAnnotation {
-            var type_ann: TypeAnnotation = undefined;
-            const target_tag: u8 = try reader.readByte();
-            type_ann.target_tag = target_tag;
-            type_ann.target_info = switch (target_tag) {
-                0x00, 0x01 => .{ .type_parameter_target = .{ .type_parameter_index = try reader.readByte() } },
-                0x10 => .{ .supertype_target = .{ .supertype_index = try reader.readInt(u16, .big) } },
-                0x11, 0x12 => .{ .type_parameter_bound_target = .{
-                    .type_parameter_index = try reader.readByte(),
-                    .bound_index = try reader.readByte(),
-                } },
-                0x13, 0x14, 0x15 => .{ .empty_target = {} },
-                0x16 => .{ .formal_parameter_target = .{ .formal_parameter_index = try reader.readByte() } },
-                0x17 => .{ .throws_target = .{ .throws_type_index = try reader.readInt(u16, .big) } },
-                0x40, 0x41 => .{ .localvar_target = blk: {
-                    const tlen: u16 = try reader.readInt(u16, .big);
-                    var table = try allocator.alloc(LocalVarTableEntry, tlen);
-                    errdefer allocator.free(table);
-                    for (0..tlen) |i| {
-                        table[i] = try reader.readStructEndian(LocalVarTableEntry, .big);
-                    }
-                    break :blk .{ .table = table };
-                } },
-                0x42 => .{ .catch_target = .{ .exception_table_index = try reader.readInt(u16, .big) } },
-                0x43...0x46 => .{ .offset_target = .{ .offset = try reader.readInt(u16, .big) } },
-                0x47...0x4B => .{ .type_argument_target = .{
-                    .offset = try reader.readInt(u16, .big),
-                    .type_argument_index = try reader.readByte(),
-                } },
-                else => return error.InvalidTargetTag,
-            };
-            type_ann.target_path = try TargetPath.read(reader, allocator);
-            type_ann.type_index = try reader.readInt(u16, .big);
-            const num_element_value_pairs: u16 = try reader.readInt(u16, .big);
-            var element_value_pairs = try allocator.alloc(ElementValuePair, num_element_value_pairs);
-            errdefer allocator.free(element_value_pairs);
-            for (0..num_element_value_pairs) |i| {
-                element_value_pairs[i] = try ElementValuePair.read(reader, allocator);
-            }
-            type_ann.element_value_pairs = element_value_pairs;
-            return type_ann;
-        }
     };
 
     //  §4.7.20.2.
@@ -817,19 +1203,6 @@ pub const AttributeInfo = struct {
             type_path_kind: u8,
             type_argument_index: u8,
         };
-
-        pub inline fn read(reader: anytype, allocator: mem.Allocator) !TargetPath {
-            const len: u8 = try reader.readByte();
-            var path = try allocator.alloc(PathEntry, len);
-            errdefer allocator.free(path);
-            for (0..len) |i| {
-                path[i] = .{
-                    .type_path_kind = try reader.readByte(),
-                    .type_argument_index = try reader.readByte(),
-                };
-            }
-            return .{ .path = path };
-        }
     };
 
     pub const ElementValuePair = struct {
@@ -881,234 +1254,8 @@ pub const AttributeInfo = struct {
                     values: []ElementValue,
                 },
             };
-
-            pub fn read(reader: anytype, allocator: mem.Allocator) anyerror!ElementValue {
-                const tag = try Tag.from_u8(try reader.readByte());
-                const value: Value = switch (tag) {
-                    .Byte, .Char, .Double, .Float, .Int, .Long, .Short, .Boolean, .String => .{ .const_value_index = try reader.readInt(u16, .big) },
-                    .Enum => .{ .enum_const_value = .{
-                        .type_name_index = try reader.readInt(u16, .big),
-                        .const_name_index = try reader.readInt(u16, .big),
-                    } },
-                    .Class => .{ .class_info_index = try reader.readInt(u16, .big) },
-                    .Annotation => .{ .annotation = try Annotation.read(reader, allocator) },
-                    .Array => blk: {
-                        const num_values: u16 = try reader.readInt(u16, .big);
-                        var values = try allocator.alloc(ElementValue, num_values);
-                        errdefer allocator.free(values);
-                        for (0..num_values) |i| {
-                            values[i] = try ElementValue.read(reader, allocator);
-                        }
-                        break :blk .{ .array_value = .{ .values = values } };
-                    },
-                };
-                return .{ .tag = tag, .value = value };
-            }
         };
-
-        pub inline fn read(reader: anytype, allocator: mem.Allocator) anyerror!ElementValuePair {
-            return .{
-                .element_name_index = try reader.readInt(u16, .big),
-                .value = try ElementValue.read(reader, allocator),
-            };
-        }
     };
-
-    pub fn read(reader: anytype, allocator: mem.Allocator, constant_pool: *const ConstantPool) !AttributeInfo {
-        const name_index: u16 = try reader.readInt(u16, .big);
-        const length = try reader.readInt(u32, .big);
-        const attr_name = try constant_pool.at_checked(name_index);
-        if (attr_name != .utf8) return error.AttributeNameMustBeUTF8;
-
-        var attribute: Attribute = undefined;
-        const name = attr_name.utf8.bytes;
-        if (mem.eql(u8, name, "ConstantValue")) {
-            attribute = .{ .ConstantValue = .{
-                .constantvalue_index = try reader.readInt(u16, .big),
-            } };
-        } else if (mem.eql(u8, name, "Code")) {
-            // IMPORTANT(anas): do not forget to free this!
-            var code = try allocator.create(CodeAttribute);
-            errdefer allocator.destroy(code);
-            code.max_stack = try reader.readInt(u16, .big);
-            code.max_locals = try reader.readInt(u16, .big);
-
-            const code_length: u32 = try reader.readInt(u32, .big);
-            const code_bytes = try allocator.alloc(u8, code_length);
-            errdefer allocator.free(code_bytes);
-            const readen = try reader.readAtLeast(code_bytes, code_length);
-            std.debug.assert(readen == code_length);
-            code.code = std.ArrayList(u8).fromOwnedSlice(allocator, code_bytes);
-
-            const exception_table_length: u16 = try reader.readInt(u16, .big);
-            var exception_table = try std.ArrayList(CodeAttribute.ExceptionTableEntry).initCapacity(allocator, exception_table_length);
-            errdefer exception_table.deinit();
-            for (0..exception_table_length) |_| {
-                // TEST(anas): make sure that `readStructEndian` apply the endianss conversation on each field
-                exception_table.appendAssumeCapacity(try reader.readStructEndian(CodeAttribute.ExceptionTableEntry, .big));
-            }
-            code.exception_table = exception_table;
-
-            const attributes_count: u16 = try reader.readInt(u16, .big);
-            var attributes = try Attributes.initCapacity(allocator, attributes_count);
-            errdefer attributes.deinit();
-            for (0..attributes_count) |_| {
-                attributes.appendAssumeCapacity(try AttributeInfo.read(reader, allocator, constant_pool));
-            }
-            code.attributes = attributes;
-
-            attribute = .{ .Code = code };
-        } else if (mem.eql(u8, name, "StackMapTable")) {
-            const number_of_entries: u16 = try reader.readInt(u16, .big);
-            var entries = try std.ArrayList(StackMapFrame).initCapacity(allocator, number_of_entries);
-            errdefer entries.deinit();
-            for (0..number_of_entries) |_| {
-                const frame_type: u8 = try reader.readByte();
-                switch (frame_type) {
-                    0...63 => entries.appendAssumeCapacity(.{ .same_frame = .{ .frame_type = frame_type } }),
-                    64...127 => entries.appendAssumeCapacity(.{ .same_locals_1_stack_item_frame = .{
-                        .frame_type = frame_type,
-                        .stack = .{try VerificationTypeInfo.read(reader)},
-                    } }),
-                    247 => entries.appendAssumeCapacity(.{ .same_locals_1_stack_item_frame_extended = .{
-                        .offset_delta = try reader.readInt(u16, .big),
-                        .stack = .{try VerificationTypeInfo.read(reader)},
-                    } }),
-                    248...250 => entries.appendAssumeCapacity(.{
-                        .chop_frame = .{ .frame_type = frame_type, .offset_delta = try reader.readInt(u16, .big) },
-                    }),
-                    251 => entries.appendAssumeCapacity(.{
-                        .same_frame_extended = .{ .offset_delta = try reader.readInt(u16, .big) },
-                    }),
-                    252...254 => entries.appendAssumeCapacity(.{ .append_frame = .{
-                        .frame_type = frame_type,
-                        .offset_delta = try reader.readInt(u16, .big),
-                        .locals = blk: {
-                            var locals = try allocator.alloc(VerificationTypeInfo, frame_type - 251);
-                            errdefer allocator.free(locals);
-                            for (0..(frame_type - 251)) |i| {
-                                locals[i] = try VerificationTypeInfo.read(reader);
-                            }
-                            break :blk locals;
-                        },
-                    } }),
-                    255 => entries.appendAssumeCapacity(.{ .full_frame = .{ .offset_delta = try reader.readInt(u16, .big), .locals = blk: {
-                        const number_of_locals: u16 = try reader.readInt(u16, .big);
-                        var locals = try std.ArrayList(VerificationTypeInfo).initCapacity(allocator, number_of_locals);
-                        errdefer locals.deinit();
-                        for (0..number_of_locals) |_| {
-                            locals.appendAssumeCapacity(try VerificationTypeInfo.read(reader));
-                        }
-                        break :blk locals;
-                    }, .stack = blk: {
-                        const number_of_stack_items: u16 = try reader.readInt(u16, .big);
-                        var stack = try std.ArrayList(VerificationTypeInfo).initCapacity(allocator, number_of_stack_items);
-                        errdefer stack.deinit();
-                        for (0..number_of_stack_items) |_| {
-                            stack.appendAssumeCapacity(try VerificationTypeInfo.read(reader));
-                        }
-                        break :blk stack;
-                    } } }),
-                    else => {
-                        // TODO(anas): return error?
-                        std.log.err("Unkown stack map frame tag", .{});
-                    },
-                }
-            }
-            attribute = .{ .StackMapTable = .{ .entries = entries } };
-        } else if (mem.eql(u8, name, "Exceptions")) {
-            const number_of_exceptions: u16 = try reader.readInt(u16, .big);
-            // TEST(anas): we are dont sure if this way is more optimal than the pre allocated ArrayList way
-            var entries = try allocator.alloc(u16, number_of_exceptions);
-            errdefer allocator.free(entries);
-            for (0..number_of_exceptions) |i| {
-                entries[i] = try reader.readInt(u16, .big);
-            }
-            attribute = .{ .Exceptions = .{ .exception_index_table = std.ArrayList(u16).fromOwnedSlice(allocator, entries) } };
-        } else if (mem.eql(u8, name, "InnerClasses")) {
-            const number_of_classes: u16 = try reader.readInt(u16, .big);
-            var classes = try allocator.alloc(InnerClass, number_of_classes);
-            errdefer allocator.free(classes);
-            for (0..number_of_classes) |i| {
-                classes[i] = try reader.readStructEndian(InnerClass, .big);
-            }
-            attribute = .{ .InnerClasses = .{ .classes = std.ArrayList(InnerClass).fromOwnedSlice(allocator, classes) } };
-        } else if (mem.eql(u8, name, "EnclosingMethod")) {
-            attribute = .{ .EnclosingMethod = .{
-                .class_index = try reader.readInt(u16, .big),
-                .method_index = try reader.readInt(u16, .big),
-            } };
-        } else if (mem.eql(u8, name, "Synthetic")) {
-            if (length != 0) return error.InvalidAttributeLength;
-            attribute = .{ .Synthetic = {} };
-        } else if (mem.eql(u8, name, "Signature")) {
-            attribute = .{ .Signature = .{ .signature_index = try reader.readInt(u16, .big) } };
-        } else if (mem.eql(u8, name, "SourceFile")) {
-            attribute = .{ .SourceFile = .{ .sourcefile_index = try reader.readInt(u16, .big) } };
-        } else if (mem.eql(u8, name, "SourceDebugExtension")) {
-            const debug_extension = try allocator.alloc(u8, length);
-            errdefer allocator.free(debug_extension);
-            const readen = try reader.readAtLeast(debug_extension, length);
-            std.debug.assert(readen == length);
-            attribute = .{ .SourceDebugExtension = .{ .debug_extension = debug_extension } };
-        } else if (mem.eql(u8, name, "LineNumberTable")) {
-            const tlen: u16 = try reader.readInt(u16, .big);
-            std.debug.assert(tlen * @sizeOf(LineNumberEntry) == (length - 2));
-            var table = try allocator.alloc(LineNumberEntry, tlen);
-            errdefer allocator.free(table);
-            for (0..tlen) |i| {
-                table[i] = try reader.readStructEndian(LineNumberEntry, .big);
-            }
-            attribute = .{ .LineNumberTable = .{
-                .line_number_table = std.ArrayList(LineNumberEntry).fromOwnedSlice(allocator, table),
-            } };
-        } else if (mem.eql(u8, name, "LocalVariableTable")) {
-            const tlen: u16 = try reader.readInt(u16, .big);
-            std.debug.assert(tlen * @sizeOf(LocalVariableEntry) == (length - 2));
-            var table = try allocator.alloc(LocalVariableEntry, tlen);
-            errdefer allocator.free(table);
-            for (0..tlen) |i| {
-                table[i] = .{
-                    .start_pc = try reader.readInt(u16, .big),
-                    .length = try reader.readInt(u16, .big),
-                    .name_index = try reader.readInt(u16, .big),
-                    .descriptor_index = try reader.readInt(u16, .big),
-                    .index = try reader.readInt(u16, .big),
-                };
-            }
-            attribute = .{ .LocalVariableTable = .{
-                .local_variable_table = std.ArrayList(LocalVariableEntry).fromOwnedSlice(allocator, table),
-            } };
-        } else if (mem.eql(u8, name, "Deprecated")) {
-            if (length > 0) return error.InvalidAttributeLength;
-            attribute = .{ .Deprecated = {} };
-        } else if (mem.eql(u8, name, "RuntimeVisibleAnnotations")) {
-            attribute = .{ .RuntimeVisibleAnnotations = try AnnotationsCollction.read(reader, allocator) };
-        } else if (mem.eql(u8, name, "RuntimeInvisibleAnnotations")) {
-            attribute = .{ .RuntimeInvisibleAnnotations = try AnnotationsCollction.read(reader, allocator) };
-        } else if (mem.eql(u8, name, "RuntimeVisibleParameterAnnotations")) {
-            attribute = .{
-                .RuntimeVisibleParameterAnnotations = try ParameterAnnotations.read(reader, allocator),
-            };
-        } else if (mem.eql(u8, name, "RuntimeInvisibleParameterAnnotations")) {
-            attribute = .{ .RuntimeInvisibleParameterAnnotations = try ParameterAnnotations.read(reader, allocator) };
-        } else if (mem.eql(u8, name, "RuntimeVisibleTypeAnnotations")) {
-            attribute = .{ .RuntimeVisibleTypeAnnotations = try TypeAnnotationsCollction.read(reader, allocator) };
-        } else {
-            std.log.warn("Unkown attribute: {s}", .{name});
-            // IMPORTANT(anas): do not forget to free this!
-            const bytes = try allocator.alloc(u8, length);
-            errdefer allocator.free(bytes);
-            const readen = try reader.readAtLeast(bytes, length);
-            std.debug.assert(readen == length);
-            attribute = .{ .Unkown = std.ArrayList(u8).fromOwnedSlice(allocator, bytes) };
-        }
-
-        return .{
-            .name_index = name_index,
-            .info = attribute,
-        };
-    }
 };
 
 pub const VerificationTypeInfo = union(VerificationTypeInfo.Tag) {
@@ -1144,23 +1291,4 @@ pub const VerificationTypeInfo = union(VerificationTypeInfo.Tag) {
             return error.InvalidVerificationInfoTag;
         }
     };
-
-    pub fn read(reader: anytype) !VerificationTypeInfo {
-        const tag = try Tag.from_u8(try reader.readByte());
-        return switch (tag) {
-            .Top_variable_info => .{ .Top_variable_info = {} },
-            .Integer_variable_info => .{ .Integer_variable_info = {} },
-            .Float_variable_info => .{ .Float_variable_info = {} },
-            .Long_variable_info => .{ .Long_variable_info = {} },
-            .Double_variable_info => .{ .Double_variable_info = {} },
-            .Null_variable_info => .{ .Null_variable_info = {} },
-            .UninitializedThis_variable_info => .{ .UninitializedThis_variable_info = {} },
-            .Object_variable_info => .{ .Object_variable_info = .{
-                .cpool_index = try reader.readInt(u16, .big),
-            } },
-            .Uninitialized_variable_info => .{ .Uninitialized_variable_info = .{
-                .offset = try reader.readInt(u16, .big),
-            } },
-        };
-    }
 };

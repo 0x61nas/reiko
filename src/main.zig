@@ -1,25 +1,35 @@
-pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+// https://man.freebsd.org/cgi/man.cgi?query=sysexits&sektion=3&apropos=0&manpath=FreeBSD+15.0-CURRENT
+const EX_USAGE = 64;
+const EX_DATAERR = 65;
+const EX_SOFTWARE = 70;
 
-    const class_file = try fs.cwd().openFile("test/samples/EmptyClass.class", .{});
-    // const class_file = try fs.cwd().openFile("test/samples/EmptyAbstract.class", .{});
-    // const class_file = try fs.cwd().openFile("test/samples/AbstractThing.class", .{});
-    // const class_file = try fs.cwd().openFile("test/samples/person/Person.class", .{});
-    // const class_file = try fs.cwd().openFile("test/samples/StaticFinal.class", .{});
-    errdefer class_file.close();
-    defer class_file.close();
-    const reader = class_file.reader();
+pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
     defer if (builtin.mode == .Debug) {
         if (false and gpa.detectLeaks()) { // TODO(anas): re-enable this
-            std.posix.exit(1);
+            process.exit(EX_SOFTWARE);
         }
     };
-    const class = try lib.ClassFile.read(reader, allocator);
+
+    const stderr = std.io.getStdErr();
+
+    const args = try process.argsAlloc(allocator);
+    if (args.len < 2) {
+        try stderr.writer().print("usage: {s} <class file>\n", .{args[0]});
+        process.exit(EX_USAGE);
+    }
+    const byte_code = try fs.cwd().readFileAlloc(allocator, args[1], std.math.maxInt(usize));
+    errdefer allocator.free(byte_code);
+    var class_reader = lib.ClassReader.init(allocator, byte_code);
+    if (!class_reader.is_somewhat_valid()) {
+        try stderr.writeAll("Invalid class file\n");
+        process.exit(EX_DATAERR);
+    }
+    const class = try class_reader.read_class();
     defer class.deinit();
     errdefer class.deinit();
+    allocator.free(byte_code); // the `class_reader'is invalid at this point
     const cp = class.constant_pool;
 
     std.log.info("{s}{s}{s} {s}", .{ blk: {
@@ -183,6 +193,7 @@ pub fn big_number_as_double(high_bytes: u32, low_bytes: u32) f64 {
 const std = @import("std");
 const builtin = @import("builtin");
 const fs = std.fs;
+const process = std.process;
 
 /// This imports the separate module containing `root.zig`. Take a look in `build.zig` for details.
 const lib = @import("reiko_lib");
