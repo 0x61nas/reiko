@@ -24,10 +24,10 @@ attributes: Attributes,
 const ClassFile = @This();
 
 // NOTE(anas): if we store them as slices it will be more efficient (probably), but we'll need to do alot of add, remove operations
-pub const Interfaces = std.ArrayList(u16);
-pub const Fields = std.ArrayList(FieldInfo);
-pub const Methods = std.ArrayList(MethodInfo);
-pub const Attributes = std.ArrayList(AttributeInfo);
+pub const Interfaces = std.array_list.Managed(u16);
+pub const Fields = std.array_list.Managed(FieldInfo);
+pub const Methods = std.array_list.Managed(MethodInfo);
+pub const Attributes = std.array_list.Managed(AttributeInfo);
 
 pub const MAGIC: u32 = 0xCAFEBABE;
 
@@ -354,10 +354,10 @@ pub const Reader = struct {
             const code_bytes = try this.allocator.alloc(u8, code_length);
             errdefer this.allocator.free(code_bytes);
             try this.fill_buff(code_bytes);
-            code.code = std.ArrayList(u8).fromOwnedSlice(this.allocator, code_bytes);
+            code.code = std.array_list.Managed(u8).fromOwnedSlice(this.allocator, code_bytes);
 
             const exception_table_length: u16 = try this.checked_read_u16();
-            var exception_table = try std.ArrayList(AttributeInfo.CodeAttribute.ExceptionTableEntry).initCapacity(this.allocator, exception_table_length);
+            var exception_table = try std.array_list.Managed(AttributeInfo.CodeAttribute.ExceptionTableEntry).initCapacity(this.allocator, exception_table_length);
             errdefer exception_table.deinit();
             for (0..exception_table_length) |_| {
                 exception_table.appendAssumeCapacity(try this.read_struct(AttributeInfo.CodeAttribute.ExceptionTableEntry));
@@ -377,7 +377,7 @@ pub const Reader = struct {
             attribute = .{ .Code = code };
         } else if (mem.eql(u8, name, "StackMapTable")) {
             const number_of_entries: u16 = try this.checked_read_u16();
-            var entries = try std.ArrayList(AttributeInfo.StackMapFrame).initCapacity(this.allocator, number_of_entries);
+            var entries = try std.array_list.Managed(AttributeInfo.StackMapFrame).initCapacity(this.allocator, number_of_entries);
             errdefer entries.deinit();
             for (0..number_of_entries) |_| {
                 const frame_type: u8 = try this.checked_read_u8();
@@ -411,7 +411,7 @@ pub const Reader = struct {
                     } }),
                     255 => entries.appendAssumeCapacity(.{ .full_frame = .{ .offset_delta = try this.checked_read_u16(), .locals = blk: {
                         const number_of_locals: u16 = try this.checked_read_u16();
-                        var locals = try std.ArrayList(VerificationTypeInfo).initCapacity(this.allocator, number_of_locals);
+                        var locals = try std.array_list.Managed(VerificationTypeInfo).initCapacity(this.allocator, number_of_locals);
                         errdefer locals.deinit();
                         for (0..number_of_locals) |_| {
                             locals.appendAssumeCapacity(try this.read_verification_type_info());
@@ -419,7 +419,7 @@ pub const Reader = struct {
                         break :blk locals;
                     }, .stack = blk: {
                         const number_of_stack_items: u16 = try this.checked_read_u16();
-                        var stack = try std.ArrayList(VerificationTypeInfo).initCapacity(this.allocator, number_of_stack_items);
+                        var stack = try std.array_list.Managed(VerificationTypeInfo).initCapacity(this.allocator, number_of_stack_items);
                         errdefer stack.deinit();
                         for (0..number_of_stack_items) |_| {
                             stack.appendAssumeCapacity(try this.read_verification_type_info());
@@ -442,7 +442,7 @@ pub const Reader = struct {
             for (0..number_of_exceptions) |i| {
                 entries[i] = this.read_u16();
             }
-            attribute = .{ .Exceptions = .{ .exception_index_table = std.ArrayList(u16).fromOwnedSlice(this.allocator, entries) } };
+            attribute = .{ .Exceptions = .{ .exception_index_table = std.array_list.Managed(u16).fromOwnedSlice(this.allocator, entries) } };
         } else if (mem.eql(u8, name, "InnerClasses")) {
             const number_of_classes: u16 = try this.checked_read_u16();
             var classes = try this.allocator.alloc(AttributeInfo.InnerClass, number_of_classes);
@@ -450,7 +450,7 @@ pub const Reader = struct {
             for (0..number_of_classes) |i| {
                 classes[i] = try this.read_struct(AttributeInfo.InnerClass);
             }
-            attribute = .{ .InnerClasses = .{ .classes = std.ArrayList(AttributeInfo.InnerClass).fromOwnedSlice(this.allocator, classes) } };
+            attribute = .{ .InnerClasses = .{ .classes = std.array_list.Managed(AttributeInfo.InnerClass).fromOwnedSlice(this.allocator, classes) } };
         } else if (mem.eql(u8, name, "EnclosingMethod")) {
             try this.expect_n_bytes(@sizeOf(u16) * 2);
             attribute = .{ .EnclosingMethod = .{
@@ -478,7 +478,7 @@ pub const Reader = struct {
                 table[i] = try this.read_struct(AttributeInfo.LineNumberEntry);
             }
             attribute = .{ .LineNumberTable = .{
-                .line_number_table = std.ArrayList(AttributeInfo.LineNumberEntry).fromOwnedSlice(this.allocator, table),
+                .line_number_table = std.array_list.Managed(AttributeInfo.LineNumberEntry).fromOwnedSlice(this.allocator, table),
             } };
         } else if (mem.eql(u8, name, "LocalVariableTable")) {
             const tlen: u16 = try this.checked_read_u16();
@@ -496,7 +496,7 @@ pub const Reader = struct {
                 };
             }
             attribute = .{ .LocalVariableTable = .{
-                .local_variable_table = std.ArrayList(AttributeInfo.LocalVariableEntry).fromOwnedSlice(this.allocator, table),
+                .local_variable_table = std.array_list.Managed(AttributeInfo.LocalVariableEntry).fromOwnedSlice(this.allocator, table),
             } };
         } else if (mem.eql(u8, name, "Deprecated")) {
             if (length > 0) return error.InvalidAttributeLength;
@@ -519,7 +519,7 @@ pub const Reader = struct {
             const bytes = try this.allocator.alloc(u8, length);
             errdefer this.allocator.free(bytes);
             try this.fill_buff(bytes);
-            attribute = .{ .Unkown = std.ArrayList(u8).fromOwnedSlice(this.allocator, bytes) };
+            attribute = .{ .Unkown = std.array_list.Managed(u8).fromOwnedSlice(this.allocator, bytes) };
         }
 
         return .{
@@ -751,10 +751,10 @@ pub const ClassAccessFlags = packed struct(u16) {
 };
 
 pub const ConstantPool = struct {
-    pool: std.ArrayList(ConstantInfo),
+    pool: std.array_list.Managed(ConstantInfo),
 
     pub inline fn initCapacity(allocator: anytype, size: usize) !ConstantPool {
-        return .{ .pool = try std.ArrayList(ConstantInfo).initCapacity(allocator, size) };
+        return .{ .pool = try std.array_list.Managed(ConstantInfo).initCapacity(allocator, size) };
     }
 
     pub inline fn appendAssumeCapacity(me: *ConstantPool, item: ConstantInfo) void {
@@ -1003,15 +1003,15 @@ pub const AttributeInfo = struct {
         Code: *CodeAttribute,
         StackMapTable: struct {
             // number_of_entries: u16,
-            entries: std.ArrayList(StackMapFrame),
+            entries: std.array_list.Managed(StackMapFrame),
         },
         Exceptions: struct {
             // number_of_exceptions: u16,
-            exception_index_table: std.ArrayList(u16),
+            exception_index_table: std.array_list.Managed(u16),
         },
         InnerClasses: struct {
             // number_of_classes: u16,
-            classes: std.ArrayList(InnerClass),
+            classes: std.array_list.Managed(InnerClass),
         },
         EnclosingMethod: struct {
             class_index: u16,
@@ -1030,12 +1030,12 @@ pub const AttributeInfo = struct {
         },
         LineNumberTable: struct {
             // u2 line_number_table_length;
-            line_number_table: std.ArrayList(LineNumberEntry),
+            line_number_table: std.array_list.Managed(LineNumberEntry),
         },
         // 4.7.13
         LocalVariableTable: struct {
             // u2 local_variable_table_length;
-            local_variable_table: std.ArrayList(LocalVariableEntry),
+            local_variable_table: std.array_list.Managed(LocalVariableEntry),
         },
         Deprecated: void, // NOTE(anas): the length must be zero.
         // NOTE(anas): There may be at most one RuntimeVisibleAnnotations attribute in the attributes table of a ClassFile, field_info, method_info, or record_component_info structure.
@@ -1049,7 +1049,7 @@ pub const AttributeInfo = struct {
 
         // NOTE(anas): Compilers are permitted to define and emit class files containing new attributes in the attributes tables of class file structures, field_info structures, method_info structures, and Code attributes (§4.7.3).
         // Java Virtual Machine implementations are permitted to recognize and use new attributes found in these attributes tables. However, any attribute not defined as part of this specification must not affect the semantics of the class file. Java Virtual Machine implementations are required to silently ignore attributes they do not recognize.
-        Unkown: std.ArrayList(u8),
+        Unkown: std.array_list.Managed(u8),
     };
 
     pub const CodeAttribute = struct {
@@ -1057,9 +1057,9 @@ pub const AttributeInfo = struct {
         max_locals: u16,
         // code_length: u32,
         // IMPORTANT(anas):  The value of code_length must be greater than zero (as the code array must not be empty) and less than 65536.
-        code: std.ArrayList(u8),
+        code: std.array_list.Managed(u8),
         // exception_table_length: u16,
-        exception_table: std.ArrayList(ExceptionTableEntry),
+        exception_table: std.array_list.Managed(ExceptionTableEntry),
         // attributes_count: u16,
         attributes: Attributes,
 
@@ -1103,9 +1103,9 @@ pub const AttributeInfo = struct {
             // frame_type: u8, // FULL_FRAME; /* 255 */
             offset_delta: u16,
             // number_of_locals: u16,
-            locals: std.ArrayList(VerificationTypeInfo),
+            locals: std.array_list.Managed(VerificationTypeInfo),
             // number_of_stack_items: u16,
-            stack: std.ArrayList(VerificationTypeInfo),
+            stack: std.array_list.Managed(VerificationTypeInfo),
         },
     };
 

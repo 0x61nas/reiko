@@ -12,11 +12,14 @@ pub fn main() !void {
         }
     };
 
-    const stderr = std.io.getStdErr();
+    var stdout_buffer: [1024]u8 = undefined;
+    const stderr_writer = std.fs.File.stderr().writer(&stdout_buffer);
+    var stderr = stderr_writer.interface;
+    defer stderr.flush() catch process.exit(EX_SOFTWARE);
 
     const args = try process.argsAlloc(allocator);
     if (args.len < 2) {
-        try stderr.writer().print("usage: {s} <class file>\n", .{args[0]});
+        try stderr.print("usage: {s} <class file>\n", .{args[0]});
         process.exit(EX_USAGE);
     }
     const byte_code = try fs.cwd().readFileAlloc(allocator, args[1], std.math.maxInt(usize));

@@ -1,6 +1,6 @@
 @echo off
 
-set ZIG_RELEASE_DEFAULT=0.14.1
+set ZIG_RELEASE_DEFAULT=0.15.1
 
 :: Determine the Zig build:
 if "%~1"=="" (
